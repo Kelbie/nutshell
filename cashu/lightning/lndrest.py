@@ -30,7 +30,7 @@ class LndRestWallet(LightningBackend):
     """https://api.lightning.community/rest/index.html#lnd-rest-api-reference"""
 
     supports_mpp = settings.mint_lnd_enable_mpp
-    supported_units = set([Unit.sat, Unit.msat])
+    supported_units = set([Unit.sat, Unit.msat, Unit.usd, Unit.eur, Unit.gbp])
     unit = Unit.sat
 
     def __init__(self, unit: Unit = Unit.sat, **kwargs):
