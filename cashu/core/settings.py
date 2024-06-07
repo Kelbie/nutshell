@@ -40,10 +40,10 @@ class CashuSettings(BaseSettings):
 
 
 class EnvSettings(CashuSettings):
-    debug: bool = Field(default=False)
+    debug: bool = Field(default=True)
     log_level: str = Field(default="INFO")
     cashu_dir: str = Field(default=os.path.join(str(Path.home()), ".cashu"))
-    debug_profiling: bool = Field(default=False)
+    debug_profiling: bool = Field(default=True)
     debug_mint_only_deprecated: bool = Field(default=False)
     db_backup_path: Optional[str] = Field(default=None)
 
