@@ -606,6 +606,8 @@ class Unit(Enum):
     sat = 0
     msat = 1
     usd = 2
+    eur = 3
+    gbp = 4
 
     def str(self, amount: int) -> str:
         if self == Unit.sat:
