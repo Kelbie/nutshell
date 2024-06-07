@@ -614,7 +614,7 @@ class Unit(Enum):
             return f"{amount} sat"
         elif self == Unit.msat:
             return f"{amount} msat"
-        elif self == Unit.usd:
+        elif self == Unit.usd or self == Unit.eur or self == Unit.gbp:
             return f"${amount/100:.2f} USD"
         else:
             raise Exception("Invalid unit")
