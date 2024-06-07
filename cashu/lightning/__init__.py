@@ -9,3 +9,9 @@ from .strike import StrikeUSDWallet  # noqa: F401
 
 if settings.mint_backend_bolt11_sat is None or settings.mint_backend_bolt11_usd is None:
     raise Exception("MINT_BACKEND_BOLT11_SAT or MINT_BACKEND_BOLT11_USD not set")
+
+if settings.mint_backend_bolt11_sat is None or settings.mint_backend_bolt11_eur is None:
+    raise Exception("MINT_BACKEND_BOLT11_SAT or MINT_BACKEND_BOLT11_EUR not set")
+
+if settings.mint_backend_bolt11_sat is None or settings.mint_backend_bolt11_gbp is None:
+    raise Exception("MINT_BACKEND_BOLT11_SAT or MINT_BACKEND_BOLT11_GBP not set")
