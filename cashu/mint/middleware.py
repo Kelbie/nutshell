@@ -50,8 +50,7 @@ async def request_validation_exception_handler(
     detail = {
         "errors": exc.errors(),
         "query_params": query_params,
-        "path": request.url.path,
-        "body": body.decode() if body else None,
+        "path": request.url.path
     }
     # log the error
     logger.error(detail)
