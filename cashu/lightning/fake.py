@@ -174,7 +174,7 @@ class FakeWallet(LightningBackend):
             fees = Amount(unit=Unit.msat, amount=fees_msat)
             amount = Amount(unit=Unit.msat, amount=amount_msat)
         elif self.unit == Unit.usd:
-            amount_usd = math.ceil(invoice_obj.amount_msat / 1e9 * self.fake_btcusd_price)
+            amount_usd = invoice_obj.amount_msat / 1e9 * self.fake_btcusd_price
             amount = Amount(unit=Unit.usd, amount=amount_usd)
             fees = Amount(unit=Unit.usd, amount=2)
         elif self.unit == Unit.eur:
