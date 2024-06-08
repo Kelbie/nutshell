@@ -205,20 +205,20 @@ async def mint_quote(
 
     Call `POST /v1/mint/bolt11` after paying the invoice.
     """
-    # logger.trace(f"> POST /v1/mint/quote/bolt11: payload={payload}")
-    # quote = await ledger.mint_quote(payload)
-    # # log quote
-    # logger.info(
-    #     f"quote={quote.quote} request={quote.request} paid={quote.paid} expiry={quote.expiry}"
-    # )
-    # resp = PostMintQuoteResponse(
-    #     request=quote.request,
-    #     quote=quote.quote,
-    #     paid=quote.paid,
-    #     expiry=quote.expiry,
-    # )
-    # logger.trace(f"< POST /v1/mint/quote/bolt11: {resp}")
-    # return resp
+    logger.trace(f"> POST /v1/mint/quote/bolt11: payload={payload}")
+    quote = await ledger.mint_quote(payload)
+    # log quote
+    logger.trace(
+        f"quote={quote.quote} request={quote.request} paid={quote.paid} expiry={quote.expiry}"
+    )
+    resp = PostMintQuoteResponse(
+        request=quote.request,
+        quote=quote.quote,
+        paid=quote.paid,
+        expiry=quote.expiry,
+    )
+    logger.trace(f"< POST /v1/mint/quote/bolt11: {resp}")
+    return resp
 
 
 @router.get(
