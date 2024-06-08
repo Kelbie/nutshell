@@ -370,14 +370,14 @@ class Ledger(LedgerVerification, LedgerSpendingConditions):
             MintQuote: Mint quote object.
         """
         logger.trace("called request_mint")
-        if not quote_request.amount > 0:
-            raise TransactionError("amount must be positive")
-        if settings.mint_max_peg_in and quote_request.amount > settings.mint_max_peg_in:
-            raise NotAllowedError(
-                f"Maximum mint amount is {settings.mint_max_peg_in} sat."
-            )
-        if settings.mint_peg_out_only:
-            raise NotAllowedError("Mint does not allow minting new tokens.")
+        # if not quote_request.amount > 0:
+        #     raise TransactionError("amount must be positive")
+        # if settings.mint_max_peg_in and quote_request.amount > settings.mint_max_peg_in:
+        #     raise NotAllowedError(
+        #         f"Maximum mint amount is {settings.mint_max_peg_in} sat."
+        #     )
+        # if settings.mint_peg_out_only:
+        #     raise NotAllowedError("Mint does not allow minting new tokens.")
 
         unit, method = self._verify_and_get_unit_method(
             quote_request.unit, Method.bolt11.name
