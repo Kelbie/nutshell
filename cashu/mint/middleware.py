@@ -45,12 +45,9 @@ async def request_validation_exception_handler(
     This function will be called when client input is not valid.
     """
     query_params = request.query_params._dict
-    # Retrieve the request body if it exists
-    body = await request.body()
     detail = {
         "errors": exc.errors(),
         "query_params": query_params,
-        "path": request.url.path
     }
     # log the error
     logger.error(detail)
