@@ -207,10 +207,6 @@ async def mint_quote(
     """
     logger.trace(f"> POST /v1/mint/quote/bolt11: payload={payload}")
     quote = await ledger.mint_quote(payload)
-    # log quote
-    logger.info(
-        f"quote={quote.quote} request={quote.request} paid={quote.paid} expiry={quote.expiry}"
-    )
     resp = PostMintQuoteResponse(
         request=quote.request,
         quote=quote.quote,
