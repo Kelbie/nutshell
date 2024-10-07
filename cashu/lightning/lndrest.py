@@ -12,18 +12,34 @@ from bolt11 import (
 )
 from loguru import logger
 
-from ..core.base import Amount, MeltQuote, PostMeltQuoteRequest, Unit
+from ..core.base import Amount, MeltQuote, Unit
 from ..core.helpers import fee_reserve
+from ..core.models import PostMeltQuoteRequest
 from ..core.settings import settings
 from .base import (
     InvoiceResponse,
     LightningBackend,
     PaymentQuoteResponse,
     PaymentResponse,
+    PaymentResult,
     PaymentStatus,
     StatusResponse,
 )
 from .macaroon import load_macaroon
+
+PAYMENT_RESULT_MAP = {
+    "UNKNOWN": PaymentResult.UNKNOWN,
+    "IN_FLIGHT": PaymentResult.PENDING,
+    "INITIATED": PaymentResult.PENDING,
+    "SUCCEEDED": PaymentResult.SETTLED,
+    "FAILED": PaymentResult.FAILED,
+}
+INVOICE_RESULT_MAP = {
+    "OPEN": PaymentResult.PENDING,
+    "SETTLED": PaymentResult.SETTLED,
+    "CANCELED": PaymentResult.FAILED,
+    "ACCEPTED": PaymentResult.PENDING,
+}
 
 
 class LndRestWallet(LightningBackend):
@@ -31,6 +47,8 @@ class LndRestWallet(LightningBackend):
 
     supports_mpp = settings.mint_lnd_enable_mpp
     supported_units = set([Unit.sat, Unit.msat, Unit.usd, Unit.eur, Unit.gbp])
+    supports_incoming_payment_stream = True
+    supports_description: bool = True
     unit = Unit.sat
 
     def __init__(self, unit: Unit = Unit.sat, **kwargs):
@@ -38,6 +56,7 @@ class LndRestWallet(LightningBackend):
         self.unit = unit
         endpoint = settings.mint_lnd_rest_endpoint
         cert = settings.mint_lnd_rest_cert
+        cert_verify = settings.mint_lnd_rest_cert_verify
 
         macaroon = (
             settings.mint_lnd_rest_macaroon
@@ -46,16 +65,19 @@ class LndRestWallet(LightningBackend):
         )
 
         if not endpoint:
-            raise Exception("cannot initialize lndrest: no endpoint")
+            raise Exception("cannot initialize LndRestWallet: no endpoint")
 
         if not macaroon:
-            raise Exception("cannot initialize lndrest: no macaroon")
+            raise Exception("cannot initialize LndRestWallet: no macaroon")
 
         if not cert:
             logger.warning(
-                "no certificate for lndrest provided, this only works if you have a"
+                "no certificate for LndRestWallet provided, this only works if you have a"
                 " publicly issued certificate"
             )
+
+        if not cert_verify:
+            logger.warning("certificate validation will be disabled for LndRestWallet")
 
         endpoint = endpoint[:-1] if endpoint.endswith("/") else endpoint
         endpoint = (
@@ -68,6 +90,10 @@ class LndRestWallet(LightningBackend):
         # and it will still check for validity of certificate and fail if its not valid
         # even on startup
         self.cert = cert or True
+
+        # disable cert verify if choosen
+        if not cert_verify:
+            self.cert = False
 
         self.auth = {"Grpc-Metadata-macaroon": self.macaroon}
         self.client = httpx.AsyncClient(
@@ -176,11 +202,7 @@ class LndRestWallet(LightningBackend):
         if r.is_error or r.json().get("payment_error"):
             error_message = r.json().get("payment_error") or r.text
             return PaymentResponse(
-                ok=False,
-                checking_id=None,
-                fee=None,
-                preimage=None,
-                error_message=error_message,
+                result=PaymentResult.FAILED, error_message=error_message
             )
 
         data = r.json()
@@ -188,11 +210,10 @@ class LndRestWallet(LightningBackend):
         fee_msat = int(data["payment_route"]["total_fees_msat"])
         preimage = base64.b64decode(data["payment_preimage"]).hex()
         return PaymentResponse(
-            ok=True,
+            result=PaymentResult.SETTLED,
             checking_id=checking_id,
             fee=Amount(unit=Unit.msat, amount=fee_msat) if fee_msat else None,
             preimage=preimage,
-            error_message=None,
         )
 
     async def pay_partial_invoice(
@@ -226,11 +247,7 @@ class LndRestWallet(LightningBackend):
         if r.is_error or data.get("message"):
             error_message = data.get("message") or r.text
             return PaymentResponse(
-                ok=False,
-                checking_id=None,
-                fee=None,
-                preimage=None,
-                error_message=error_message,
+                result=PaymentResult.FAILED, error_message=error_message
             )
 
         # We need to set the mpp_record for a partial payment
@@ -261,58 +278,52 @@ class LndRestWallet(LightningBackend):
         if r.is_error or data.get("message"):
             error_message = data.get("message") or r.text
             return PaymentResponse(
-                ok=False,
-                checking_id=None,
-                fee=None,
-                preimage=None,
-                error_message=error_message,
+                result=PaymentResult.FAILED, error_message=error_message
             )
 
-        ok = data.get("status") == "SUCCEEDED"
+        result = PAYMENT_RESULT_MAP.get(data.get("status"), PaymentResult.UNKNOWN)
         checking_id = invoice.payment_hash
-        fee_msat = int(data["route"]["total_fees_msat"])
-        preimage = base64.b64decode(data["preimage"]).hex()
+        fee_msat = int(data["route"]["total_fees_msat"]) if data.get("route") else None
+        preimage = (
+            base64.b64decode(data["preimage"]).hex() if data.get("preimage") else None
+        )
         return PaymentResponse(
-            ok=ok,
+            result=result,
             checking_id=checking_id,
             fee=Amount(unit=Unit.msat, amount=fee_msat) if fee_msat else None,
             preimage=preimage,
-            error_message=None,
         )
 
     async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
         r = await self.client.get(url=f"/v1/invoice/{checking_id}")
 
-        if r.is_error or not r.json().get("settled"):
-            # this must also work when checking_id is not a hex recognizable by lnd
-            # it will return an error and no "settled" attribute on the object
-            return PaymentStatus(paid=None)
+        if r.is_error:
+            logger.error(f"Couldn't get invoice status: {r.text}")
+            return PaymentStatus(result=PaymentResult.UNKNOWN, error_message=r.text)
 
-        return PaymentStatus(paid=True)
+        data = None
+        try:
+            data = r.json()
+        except json.JSONDecodeError as e:
+            logger.error(f"Incomprehensible response: {e}")
+            return PaymentStatus(result=PaymentResult.UNKNOWN, error_message=str(e))
+        if not data or not data.get("state"):
+            return PaymentStatus(
+                result=PaymentResult.UNKNOWN, error_message="no invoice state"
+            )
+        return PaymentStatus(
+            result=INVOICE_RESULT_MAP[data["state"]],
+        )
 
     async def get_payment_status(self, checking_id: str) -> PaymentStatus:
         """
         This routine checks the payment status using routerpc.TrackPaymentV2.
         """
         # convert checking_id from hex to base64 and some LND magic
-        try:
-            checking_id = base64.urlsafe_b64encode(bytes.fromhex(checking_id)).decode(
-                "ascii"
-            )
-        except ValueError:
-            return PaymentStatus(paid=None)
-
+        checking_id = base64.urlsafe_b64encode(bytes.fromhex(checking_id)).decode(
+            "ascii"
+        )
         url = f"/v2/router/track/{checking_id}"
-
-        # check payment.status:
-        # https://api.lightning.community/?python=#paymentpaymentstatus
-        statuses = {
-            "UNKNOWN": None,
-            "IN_FLIGHT": None,
-            "SUCCEEDED": True,
-            "FAILED": False,
-        }
-
         async with self.client.stream("GET", url, timeout=None) as r:
             async for json_line in r.aiter_lines():
                 try:
@@ -326,27 +337,37 @@ class LndRestWallet(LightningBackend):
                             else line["error"]
                         )
                         logger.error(f"LND get_payment_status error: {message}")
-                        return PaymentStatus(paid=None)
+                        return PaymentStatus(
+                            result=PaymentResult.UNKNOWN, error_message=message
+                        )
 
                     payment = line.get("result")
 
                     # payment exists
                     if payment is not None and payment.get("status"):
+                        preimage = (
+                            payment.get("payment_preimage")
+                            if payment.get("payment_preimage") != "0" * 64
+                            else None
+                        )
                         return PaymentStatus(
-                            paid=statuses[payment["status"]],
+                            result=PAYMENT_RESULT_MAP[payment["status"]],
                             fee=(
                                 Amount(unit=Unit.msat, amount=payment.get("fee_msat"))
                                 if payment.get("fee_msat")
                                 else None
                             ),
-                            preimage=payment.get("payment_preimage"),
+                            preimage=preimage,
                         )
                     else:
-                        return PaymentStatus(paid=None)
+                        return PaymentStatus(
+                            result=PaymentResult.UNKNOWN,
+                            error_message="no payment status",
+                        )
                 except Exception:
                     continue
 
-        return PaymentStatus(paid=None)
+        return PaymentStatus(result=PaymentResult.UNKNOWN, error_message="timeout")
 
     async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
         while True:
@@ -375,8 +396,8 @@ class LndRestWallet(LightningBackend):
     ) -> PaymentQuoteResponse:
         # get amount from melt_quote or from bolt11
         amount = (
-            Amount(Unit[melt_quote.unit], melt_quote.amount)
-            if melt_quote.amount
+            Amount(Unit[melt_quote.unit], melt_quote.mpp_amount)
+            if melt_quote.is_mpp
             else None
         )
 
