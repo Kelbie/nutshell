@@ -726,9 +726,11 @@ class MintKeyset:
         if self.input_fee_ppk < 0:
             raise Exception("Input fee must be non-negative.")
 
-        self.version_tuple = tuple(
-            [int(i) for i in self.version.split(".")] if self.version else []
-        )
+        # Handle the case where version is 'N/A' or other non-numeric values
+        if self.version and self.version.lower() != 'n/a':
+            self.version_tuple = tuple([int(i) for i in self.version.split(".")])
+        else:
+            self.version_tuple = tuple()  # or default to (0, 0, 0) if you prefer
 
         # infer unit from derivation path
         if not unit:
