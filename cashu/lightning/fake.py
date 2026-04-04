@@ -7,6 +7,9 @@ from typing import AsyncGenerator, Dict, List, Optional
 
 from bolt11 import (
     Bolt11,
+    Feature,
+    Features,
+    FeatureState,
     MilliSatoshi,
     TagChar,
     Tags,
@@ -30,10 +33,9 @@ from .base import (
 
 
 class FakeWallet(LightningBackend):
-    fake_btcusd_price = 1e8 / 1337
-    fake_btceur_price = 1e8 / 1337
-    fake_btcgbp_price = 1e8 / 1337
-    queue: asyncio.Queue[Bolt11] = asyncio.Queue(0)
+    unit: Unit
+    fake_btc_price = 1e8 / 1337
+    paid_invoices_queue: asyncio.Queue[Bolt11] = asyncio.Queue(0)
     payment_secrets: Dict[str, str] = dict()
     created_invoices: List[Bolt11] = []
     paid_invoices_outgoing: List[Bolt11] = []
@@ -48,7 +50,12 @@ class FakeWallet(LightningBackend):
     ).hex()
 
     supported_units = {Unit.sat, Unit.msat, Unit.usd, Unit.eur}
-    unit = Unit.sat
+    balance: Dict[Unit, Amount] = {
+        Unit.sat: Amount(Unit.sat, settings.fakewallet_balance_sat),
+        Unit.msat: Amount(Unit.msat, settings.fakewallet_balance_sat * 1000),
+        Unit.usd: Amount(Unit.usd, settings.fakewallet_balance_usd),
+        Unit.eur: Amount(Unit.eur, settings.fakewallet_balance_eur),
+    }
 
     supports_incoming_payment_stream: bool = True
     supports_description: bool = True
@@ -58,7 +65,10 @@ class FakeWallet(LightningBackend):
         self.unit = unit
 
     async def status(self) -> StatusResponse:
-        return StatusResponse(error_message=None, balance=1337)
+        return StatusResponse(
+            error_message=None,
+            balance=Amount(self.unit, self.balance[self.unit].amount),
+        )
 
     async def mark_invoice_paid(self, invoice: Bolt11, delay=True) -> None:
         if invoice in self.paid_invoices_incoming:
@@ -69,6 +79,25 @@ class FakeWallet(LightningBackend):
             await asyncio.sleep(settings.fakewallet_delay_incoming_payment)
         self.paid_invoices_incoming.append(invoice)
         await self.paid_invoices_queue.put(invoice)
+        self.update_balance(invoice, incoming=True)
+
+    def update_balance(self, invoice: Bolt11, incoming: bool) -> None:
+        amount_bolt11 = invoice.amount_msat
+        assert amount_bolt11, "invoice has no amount."
+        amount = int(amount_bolt11)
+        if self.unit == Unit.sat:
+            amount = amount // 1000
+        elif self.unit == Unit.usd or self.unit == Unit.eur:
+            amount = math.ceil(amount / 1e9 * self.fake_btc_price)
+        elif self.unit == Unit.msat:
+            amount = amount
+        else:
+            raise NotImplementedError()
+
+        if incoming:
+            self.balance[self.unit] += Amount(self.unit, amount)
+        else:
+            self.balance[self.unit] -= Amount(self.unit, amount)
 
     def create_dummy_bolt11(self, payment_hash: str) -> Bolt11:
         tags = Tags()
@@ -92,6 +121,12 @@ class FakeWallet(LightningBackend):
     ) -> InvoiceResponse:
         self.assert_unit_supported(amount.unit)
         tags = Tags()
+        tags.add(
+            TagChar.features,
+            Features.from_feature_list(
+                {Feature.payment_secret: FeatureState.supported}
+            ),
+        )
 
         if description_hash:
             tags.add(TagChar.description_hash, description_hash.hex())
@@ -120,17 +155,11 @@ class FakeWallet(LightningBackend):
         amount_msat = 0
         if self.unit == Unit.sat:
             amount_msat = MilliSatoshi(amount.to(Unit.msat, round="up").amount)
+        elif self.unit == Unit.msat:
+            amount_msat = MilliSatoshi(amount.amount)
         elif self.unit == Unit.usd or self.unit == Unit.eur:
             amount_msat = MilliSatoshi(
-                math.ceil(amount.amount / self.fake_btcusd_price * 1e9)
-            )
-        elif self.unit == Unit.eur:
-            amount_msat = MilliSatoshi(
-                math.ceil(amount.amount / self.fake_btceur_price * 1e9)
-            )
-        elif self.unit == Unit.gbp:
-            amount_msat = MilliSatoshi(
-                math.ceil(amount.amount / self.fake_btcgbp_price * 1e9)
+                math.ceil(amount.amount / self.fake_btc_price * 1e9)
             )
         else:
             raise NotImplementedError()
@@ -166,6 +195,8 @@ class FakeWallet(LightningBackend):
             await asyncio.sleep(settings.fakewallet_delay_outgoing_payment)
 
         if settings.fakewallet_pay_invoice_state:
+            if settings.fakewallet_pay_invoice_state == "SETTLED":
+                self.update_balance(invoice, incoming=False)
             return PaymentResponse(
                 result=PaymentResult[settings.fakewallet_pay_invoice_state],
                 checking_id=invoice.payment_hash,
@@ -179,6 +210,7 @@ class FakeWallet(LightningBackend):
             else:
                 raise ValueError("Invoice already paid")
 
+            self.update_balance(invoice, incoming=False)
             return PaymentResponse(
                 result=PaymentResult.SETTLED,
                 checking_id=invoice.payment_hash,
@@ -192,9 +224,13 @@ class FakeWallet(LightningBackend):
             )
 
     async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
-        await self.mark_invoice_paid(self.create_dummy_bolt11(checking_id), delay=False)
+        invoice = next(
+            (i for i in self.created_invoices if i.payment_hash == checking_id), None
+        ) or self.create_dummy_bolt11(checking_id)
+
         paid_chceking_ids = [i.payment_hash for i in self.paid_invoices_incoming]
-        if checking_id in paid_chceking_ids:
+        if checking_id in paid_chceking_ids or settings.fakewallet_brr:
+            await self.mark_invoice_paid(invoice, delay=False)
             return PaymentStatus(result=PaymentResult.SETTLED)
         else:
             return PaymentStatus(
@@ -216,23 +252,15 @@ class FakeWallet(LightningBackend):
         invoice_obj = decode(melt_quote.request)
         assert invoice_obj.amount_msat, "invoice has no amount."
 
-        if self.unit == Unit.sat:
+        if self.unit == Unit.sat or self.unit == Unit.msat:
             amount_msat = int(invoice_obj.amount_msat)
             fees_msat = fee_reserve(amount_msat)
             fees = Amount(unit=Unit.msat, amount=fees_msat)
             amount = Amount(unit=Unit.msat, amount=amount_msat)
-        elif self.unit == Unit.usd:
-            amount_usd = invoice_obj.amount_msat / 1e9 * self.fake_btcusd_price
-            amount = Amount(unit=Unit.usd, amount=amount_usd)
-            fees = Amount(unit=Unit.usd, amount=2)
-        elif self.unit == Unit.eur:
-            amount_eur = math.ceil(invoice_obj.amount_msat / 1e9 * self.fake_btceur_price)
-            amount = Amount(unit=Unit.eur, amount=amount_eur)
-            fees = Amount(unit=Unit.eur, amount=2)
-        elif self.unit == Unit.gbp:
-            amount_gbp = math.ceil(invoice_obj.amount_msat / 1e9 * self.fake_btcgbp_price)
-            amount = Amount(unit=Unit.gbp, amount=amount_gbp)
-            fees = Amount(unit=Unit.gbp, amount=2)
+        elif self.unit == Unit.usd or self.unit == Unit.eur:
+            amount_usd = math.ceil(invoice_obj.amount_msat / 1e9 * self.fake_btc_price)
+            amount = Amount(unit=self.unit, amount=amount_usd)
+            fees = Amount(unit=self.unit, amount=2)
         else:
             raise NotImplementedError()
 

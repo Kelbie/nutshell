@@ -1,4 +1,7 @@
+import asyncio
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from traceback import print_exception
 
 from fastapi import FastAPI, status
@@ -10,10 +13,16 @@ from starlette.requests import Request
 from ..core.errors import CashuError
 from ..core.logging import configure_logger
 from ..core.settings import settings
-from .router import router
+from .auth.router import auth_router
+from .router import redis, router
 from .router_deprecated import router_deprecated
-from .startup import shutdown_mint as shutdown_mint_init
-from .startup import start_mint_init
+from .startup import (
+    shutdown_management_rpc,
+    shutdown_mint,
+    start_auth,
+    start_management_rpc,
+    start_mint,
+)
 
 if settings.debug_profiling:
     pass
@@ -23,27 +32,42 @@ if settings.mint_rate_limit:
 
 from .middleware import add_middlewares, request_validation_exception_handler
 
-# this errors with the tests but is the appropriate way to handle startup and shutdown
-# until then, we use @app.on_event("startup")
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     # startup routines here
-#     await start_mint_init()
-#     yield
-#     # shutdown routines here
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    await start_mint()
+    if settings.mint_redis_cache_enabled:
+        await redis.test_connection()
+    if settings.mint_require_auth:
+        await start_auth()
+    if settings.mint_rpc_server_enable:
+        await start_management_rpc()
+    try:
+        yield
+    except asyncio.CancelledError:
+        # Handle the cancellation gracefully
+        logger.info("Shutdown process interrupted by CancelledError")
+    finally:
+        try:
+            await shutdown_management_rpc()
+            await redis.disconnect()
+            await shutdown_mint()
+        except asyncio.CancelledError:
+            logger.error("CancelledError during shutdown, shutting down forcefully")
 
 
 def create_app(config_object="core.settings") -> FastAPI:
     configure_logger()
 
     app = FastAPI(
-        title="Nutshell Cashu Mint",
-        description="Ecash wallet and mint based on the Cashu protocol.",
+        title="Nutshell Mint",
+        description="Ecash mint based on the Cashu protocol.",
         version=settings.version,
         license_info={
             "name": "MIT License",
             "url": "https://raw.githubusercontent.com/cashubtc/cashu/main/LICENSE",
         },
+        lifespan=lifespan,
     )
 
     return app
@@ -91,7 +115,7 @@ async def catch_exceptions(request: Request, call_next):
 
 
 # Add exception handlers
-app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)  # type: ignore
 
 # Add routers
 if settings.debug_mint_only_deprecated:
@@ -100,12 +124,5 @@ else:
     app.include_router(router=router, tags=["Mint"])
     app.include_router(router=router_deprecated, tags=["Deprecated"], deprecated=True)
 
-
-@app.on_event("startup")
-async def startup_mint():
-    await start_mint_init()
-
-
-@app.on_event("shutdown")
-async def shutdown_mint():
-    await shutdown_mint_init()
+if settings.mint_require_auth:
+    app.include_router(auth_router, tags=["Auth"])

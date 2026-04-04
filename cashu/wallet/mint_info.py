@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 from ..core.base import Method, Unit
 from ..core.models import MintInfoContact, Nut15MppSupport
-from ..core.nuts import MPP_NUT, WEBSOCKETS_NUT
+from ..core.nuts.nuts import MINT_QUOTE_SIGNATURE_NUT, MPP_NUT, WEBSOCKETS_NUT
 
 
 class MintInfo(BaseModel):
@@ -16,6 +16,7 @@ class MintInfo(BaseModel):
     contact: Optional[List[MintInfoContact]]
     motd: Optional[str]
     icon_url: Optional[str]
+    tos_url: Optional[str]
     time: Optional[int]
     nuts: Optional[Dict[int, Any]]
 
@@ -31,11 +32,11 @@ class MintInfo(BaseModel):
         if not self.nuts:
             return False
         nut_15 = self.nuts.get(MPP_NUT)
-        if not nut_15 or not self.supports_nut(MPP_NUT):
+        if not nut_15 or not self.supports_nut(MPP_NUT) or not nut_15.get("methods"):
             return False
 
-        for entry in nut_15:
-            entry_obj = Nut15MppSupport.parse_obj(entry)
+        for entry in nut_15["methods"]:
+            entry_obj = Nut15MppSupport.model_validate(entry)
             if entry_obj.method == method and entry_obj.unit == unit.name:
                 return True
 
@@ -52,4 +53,12 @@ class MintInfo(BaseModel):
             if entry["method"] == method.name and entry["unit"] == unit.name:
                 if "bolt11_mint_quote" in entry["commands"]:
                     return True
+        return False
+
+    def supports_mint_quote_signature(self) -> bool:
+        if not self.nuts:
+            return False
+        nut20 = self.nuts.get(MINT_QUOTE_SIGNATURE_NUT, None)
+        if nut20:
+            return nut20["supported"]
         return False

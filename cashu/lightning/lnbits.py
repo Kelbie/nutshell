@@ -7,6 +7,8 @@ import httpx
 from bolt11 import (
     decode,
 )
+from loguru import logger
+from websockets.client import connect
 
 from ..core.base import Amount, MeltQuote, Unit
 from ..core.helpers import fee_reserve
@@ -38,33 +40,30 @@ class LNbitsWallet(LightningBackend):
         self.client = httpx.AsyncClient(
             verify=not settings.debug,
             headers={"X-Api-Key": settings.mint_lnbits_key},
+            timeout=None,
         )
+        self.ws_url = f"{self.endpoint.replace('http', 'ws', 1)}/api/v1/ws/{settings.mint_lnbits_key}"
+        self.old_api = True
 
     async def status(self) -> StatusResponse:
         try:
             r = await self.client.get(url=f"{self.endpoint}/api/v1/wallet", timeout=15)
             r.raise_for_status()
+            data: dict = r.json()
         except Exception as exc:
             return StatusResponse(
                 error_message=f"Failed to connect to {self.endpoint} due to: {exc}",
-                balance=0,
+                balance=Amount(self.unit, 0),
+            )
+        if data.get("detail"):
+            return StatusResponse(
+                error_message=f"LNbits error: {data['detail']}",
+                balance=Amount(self.unit, 0),
             )
 
-        try:
-            data: dict = r.json()
-        except Exception:
-            return StatusResponse(
-                error_message=(
-                    f"Received invalid response from {self.endpoint}: {r.text}"
-                ),
-                balance=0,
-            )
-        if "detail" in data:
-            return StatusResponse(
-                error_message=f"LNbits error: {data['detail']}", balance=0
-            )
-
-        return StatusResponse(error_message=None, balance=data["balance"])
+        return StatusResponse(
+            error_message=None, balance=Amount(Unit.sat, data["balance"] // 1000)
+        )
 
     async def create_invoice(
         self,
@@ -87,11 +86,18 @@ class LNbitsWallet(LightningBackend):
                 url=f"{self.endpoint}/api/v1/payments", json=data
             )
             r.raise_for_status()
-        except Exception as e:
-            return InvoiceResponse(ok=False, error_message=str(e))
+            data = r.json()
+        except httpx.HTTPStatusError:
+            return InvoiceResponse(
+                ok=False, error_message=f"HTTP status: {r.reason_phrase}"
+            )
+        except Exception as exc:
+            return InvoiceResponse(ok=False, error_message=str(exc))
+        if data.get("detail"):
+            return InvoiceResponse(ok=False, error_message=data["detail"])
 
-        data = r.json()
-        checking_id, payment_request = data["checking_id"], data["payment_request"]
+        checking_id = data["checking_id"]
+        payment_request = data.get("bolt11") or data.get("payment_request")
 
         return InvoiceResponse(
             ok=True,
@@ -109,17 +115,19 @@ class LNbitsWallet(LightningBackend):
                 timeout=None,
             )
             r.raise_for_status()
-        except Exception:
-            error_message = r.json().get("detail") or r.reason_phrase
+            data: dict = r.json()
+        except httpx.HTTPStatusError:
             return PaymentResponse(
-                result=PaymentResult.FAILED, error_message=error_message
+                result=PaymentResult.FAILED,
+                error_message=f"HTTP status: {r.reason_phrase}",
             )
-        if r.json().get("detail"):
+        except Exception as exc:
+            return PaymentResponse(result=PaymentResult.FAILED, error_message=str(exc))
+        if data.get("detail"):
             return PaymentResponse(
-                result=PaymentResult.FAILED, error_message=(r.json()["detail"],)
+                result=PaymentResult.FAILED, error_message=data["detail"]
             )
 
-        data: dict = r.json()
         checking_id = data.get("payment_hash")
         if not checking_id:
             return PaymentResponse(
@@ -142,6 +150,7 @@ class LNbitsWallet(LightningBackend):
                 url=f"{self.endpoint}/api/v1/payments/{checking_id}"
             )
             r.raise_for_status()
+            data: dict = r.json()
         except Exception as e:
             return PaymentStatus(result=PaymentResult.UNKNOWN, error_message=str(e))
         data: dict = r.json()
@@ -150,11 +159,13 @@ class LNbitsWallet(LightningBackend):
                 result=PaymentResult.UNKNOWN, error_message=data["detail"]
             )
 
-        if data["paid"]:
+        status = data.get("details", {}).get("status", None)
+
+        if data.get("paid", False):
             result = PaymentResult.SETTLED
-        elif not data["paid"] and data["details"]["pending"]:
+        elif status == "pending" or data.get("details", {}).get("pending", False):
             result = PaymentResult.PENDING
-        elif not data["paid"] and not data["details"]["pending"]:
+        elif status == "failed":
             result = PaymentResult.FAILED
         else:
             result = PaymentResult.UNKNOWN
@@ -171,24 +182,28 @@ class LNbitsWallet(LightningBackend):
                 url=f"{self.endpoint}/api/v1/payments/{checking_id}"
             )
             r.raise_for_status()
+            data = r.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code != 404:
                 raise e
             return PaymentStatus(
                 result=PaymentResult.UNKNOWN, error_message=e.response.text
             )
+        except Exception as e:
+            return PaymentStatus(result=PaymentResult.UNKNOWN, error_message=str(e))
 
-        data = r.json()
         if "paid" not in data and "details" not in data:
             return PaymentStatus(
                 result=PaymentResult.UNKNOWN, error_message="invalid response"
             )
 
-        if data["paid"]:
+        status = data.get("details", {}).get("status", None)
+
+        if data.get("paid", False):
             result = PaymentResult.SETTLED
-        elif not data["paid"] and data["details"]["pending"]:
+        elif status == "pending" or data.get("details", {}).get("pending", False):
             result = PaymentResult.PENDING
-        elif not data["paid"] and not data["details"]["pending"]:
+        elif status == "failed":
             result = PaymentResult.FAILED
         else:
             result = PaymentResult.UNKNOWN
@@ -215,40 +230,83 @@ class LNbitsWallet(LightningBackend):
         )
 
     async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
-        url = f"{self.endpoint}/api/v1/payments/sse"
+        retry_delay = 0
+        max_retry_delay = settings.mint_retry_exponential_backoff_max_delay
+        
+        while True:
+            try:
+                # --- LNBITS RETRO-COMPATIBILITY ---
+                if self.old_api:
+                    url = f"{self.endpoint}/api/v1/payments/sse"
 
-        try:
-            sse_headers = self.client.headers.copy()
-            sse_headers.update(
-                {
-                    "accept": "text/event-stream",
-                    "cache-control": "no-cache",
-                    "connection": "keep-alive",
-                }
-            )
-            async with self.client.stream(
-                "GET",
-                url,
-                content="text/event-stream",
-                timeout=None,
-                headers=sse_headers,
-            ) as r:
-                sse_trigger = False
-                async for line in r.aiter_lines():
-                    # The data we want to listen to is of this shape:
-                    # event: payment-received
-                    # data: {.., "payment_hash" : "asd"}
-                    if line.startswith("event: payment-received"):
-                        sse_trigger = True
-                        continue
-                    elif sse_trigger and line.startswith("data:"):
-                        data = json.loads(line[len("data:") :])
-                        sse_trigger = False
-                        yield data["payment_hash"]
-                    else:
-                        sse_trigger = False
+                    try:
+                        sse_headers = self.client.headers.copy()
+                        sse_headers.update(
+                            {
+                                "accept": "text/event-stream",
+                                "cache-control": "no-cache",
+                                "connection": "keep-alive",
+                            }
+                        )
+                        async with self.client.stream(
+                            "GET",
+                            url,
+                            content="text/event-stream",
+                            timeout=None,
+                            headers=sse_headers,
+                        ) as r:
+                            # Reset retry delay on successful connection
+                            retry_delay = 0
+                            sse_trigger = False
+                            async for line in r.aiter_lines():
+                                if "Payment does not exist." in line:
+                                    logger.debug("New API detected. Setting old_api = False")
+                                    self.old_api = False
+                                # The data we want to listen to is of this shape:
+                                # event: payment-received
+                                # data: {.., "payment_hash" : "asd"}
+                                if line.startswith("event: payment-received"):
+                                    sse_trigger = True
+                                    continue
+                                elif sse_trigger and line.startswith("data:"):
+                                    data = json.loads(line[len("data:") :])
+                                    sse_trigger = False
+                                    yield data["payment_hash"]
+                                else:
+                                    sse_trigger = False
 
-        except (OSError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout):
-            pass
+                    except (OSError, httpx.ReadError, httpx.ConnectError, httpx.ReadTimeout):
+                        pass
+                
+                if self.old_api:
+                    await asyncio.sleep(retry_delay)
+                    # Exponential backoff
+                    retry_delay = max(settings.mint_retry_exponential_backoff_base_delay, min(retry_delay * 2, max_retry_delay))
+                    continue
+                # --- END LNBITS RETRO-COMPATIBILITY ---
 
-        await asyncio.sleep(1)
+                async with connect(self.ws_url) as ws:
+                    logger.info("connected to LNbits fundingsource websocket.")
+                    # Reset retry delay on successful connection
+                    retry_delay = 0
+                    while True:
+                        message = await ws.recv()
+                        message_dict = json.loads(message)
+                        if (
+                            message_dict
+                            and message_dict.get("payment")
+                            and message_dict["payment"].get("payment_hash")
+                            and message_dict["payment"].get("amount") > 0
+                        ):
+                            payment_hash = message_dict["payment"]["payment_hash"]
+                            logger.info(f"payment-received: {payment_hash}")
+                            yield payment_hash
+            except Exception as exc:
+                logger.error(
+                    f"lost connection to LNbits fundingsource websocket: '{exc}', retrying in {retry_delay}"
+                    " seconds"
+                )
+                await asyncio.sleep(retry_delay)
+                
+                # Exponential backoff
+                retry_delay = max(settings.mint_retry_exponential_backoff_base_delay, min(retry_delay * 2, max_retry_delay))

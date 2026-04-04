@@ -1,15 +1,18 @@
 import base64
+import datetime
 import json
 import math
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from sqlite3 import Row
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Optional, Union
 
 import cbor2
 from loguru import logger
-from pydantic import BaseModel, root_validator
+from pydantic import BaseModel, ConfigDict, RootModel, model_validator
+from sqlalchemy import RowMapping
 
 from cashu.core.json_rpc.base import JSONRPCSubscriptionKinds
 
@@ -18,9 +21,10 @@ from .crypto.aes import AESCipher
 from .crypto.b_dhke import hash_to_curve
 from .crypto.keys import (
     derive_keys,
-    derive_keys_sha256,
+    derive_keys_deprecated_pre_0_15,
     derive_keyset_id,
     derive_keyset_id_deprecated,
+    derive_keyset_id_v2,
     derive_pubkeys,
 )
 from .crypto.secp import PrivateKey, PublicKey
@@ -64,12 +68,11 @@ class ProofState(LedgerEvent):
     state: ProofSpentState
     witness: Optional[str] = None
 
-    @root_validator()
-    def check_witness(cls, values):
-        state, witness = values.get("state"), values.get("witness")
-        if witness is not None and state != ProofSpentState.spent:
+    @model_validator(mode="after")
+    def check_witness(self):
+        if self.witness is not None and self.state != ProofSpentState.spent:
             raise ValueError('Witness can only be set if the spent state is "SPENT"')
-        return values
+        return self
 
     @property
     def identifier(self) -> str:
@@ -95,21 +98,7 @@ class ProofState(LedgerEvent):
 
 class HTLCWitness(BaseModel):
     preimage: Optional[str] = None
-    signature: Optional[str] = None
-
-    @classmethod
-    def from_witness(cls, witness: str):
-        return cls(**json.loads(witness))
-
-
-class P2SHWitness(BaseModel):
-    """
-    Unlocks P2SH spending condition of a Proof
-    """
-
-    script: str
-    signature: str
-    address: Union[str, None] = None
+    signatures: Optional[List[str]] = None
 
     @classmethod
     def from_witness(cls, witness: str):
@@ -145,19 +134,19 @@ class Proof(BaseModel):
     reserved: Union[None, bool] = False
     # unique ID of send attempt, used for grouping pending tokens in the wallet
     send_id: Union[None, str] = ""
-    time_created: Union[None, str] = ""
-    time_reserved: Union[None, str] = ""
+    time_created: Union[None, str, int] = ""
+    time_reserved: Union[None, str, int] = ""
     derivation_path: Union[None, str] = ""  # derivation path of the proof
-    mint_id: Union[
-        None, str
-    ] = None  # holds the id of the mint operation that created this proof
-    melt_id: Union[
-        None, str
-    ] = None  # holds the id of the melt operation that destroyed this proof
+    mint_id: Union[None, str] = (
+        None  # holds the id of the mint operation that created this proof
+    )
+    melt_id: Union[None, str] = (
+        None  # holds the id of the melt operation that destroyed this proof
+    )
 
     def __init__(self, **data):
         super().__init__(**data)
-        self.Y = hash_to_curve(self.secret.encode("utf-8")).serialize().hex()
+        self.Y = hash_to_curve(self.secret.encode("utf-8")).format().hex()
 
     @classmethod
     def from_dict(cls, proof_dict: dict):
@@ -179,12 +168,15 @@ class Proof(BaseModel):
         # optional fields
         if include_dleq:
             assert self.dleq, "DLEQ proof is missing"
-            return_dict["dleq"] = self.dleq.dict()  # type: ignore
+            return_dict["dleq"] = self.dleq.model_dump()  # type: ignore
 
         if self.witness:
             return_dict["witness"] = self.witness
 
         return return_dict
+
+    def to_base64(self):
+        return base64.b64encode(cbor2.dumps(self.to_dict(include_dleq=True))).decode()
 
     def to_dict_no_dleq(self):
         # dictionary without the fields that don't need to be send to Carol
@@ -203,17 +195,31 @@ class Proof(BaseModel):
     @property
     def p2pksigs(self) -> List[str]:
         assert self.witness, "Witness is missing for p2pk signature"
-        return P2PKWitness.from_witness(self.witness).signatures
+        try:
+            return P2PKWitness.from_witness(self.witness).signatures
+        except Exception:
+            return []
 
     @property
-    def htlcpreimage(self) -> Union[str, None]:
+    def htlcpreimage(self) -> str | None:
         assert self.witness, "Witness is missing for htlc preimage"
-        return HTLCWitness.from_witness(self.witness).preimage
+        try:
+            return HTLCWitness.from_witness(self.witness).preimage
+        except Exception:
+            return None
+
+    @property
+    def htlcsigs(self) -> List[str] | None:
+        assert self.witness, "Witness is missing for htlc signatures"
+        try:
+            return HTLCWitness.from_witness(self.witness).signatures
+        except Exception:
+            return None
 
 
-class Proofs(BaseModel):
+class Proofs(RootModel):
     # NOTE: not used in Pydantic validation
-    __root__: List[Proof]
+    root: List[Proof]
 
 
 class BlindedMessage(BaseModel):
@@ -224,12 +230,11 @@ class BlindedMessage(BaseModel):
     amount: int
     id: str  # Keyset id
     B_: str  # Hex-encoded blinded message
-    witness: Union[str, None] = None  # witnesses (used for P2PK with SIG_ALL)
+    C_: Optional[str] = None  # Hex-encoded signature, None if not signed yet
 
-    @property
-    def p2pksigs(self) -> List[str]:
-        assert self.witness, "Witness missing in output"
-        return P2PKWitness.from_witness(self.witness).signatures
+    @classmethod
+    def from_row(cls, row: RowMapping):
+        return cls(amount=row["amount"], B_=row["b_"], id=row["id"], C_=row.get("c_"))
 
 
 class BlindedMessage_Deprecated(BaseModel):
@@ -269,20 +274,7 @@ class BlindedSignature(BaseModel):
         )
 
 
-# ------- LIGHTNING INVOICE -------
-
-
-class Invoice(BaseModel):
-    amount: int
-    bolt11: str
-    id: str
-    out: Union[None, bool] = None
-    payment_hash: Union[None, str] = None
-    preimage: Union[str, None] = None
-    issued: Union[None, bool] = False
-    paid: Union[None, bool] = False
-    time_created: Union[None, str, int, float] = ""
-    time_paid: Union[None, str, int, float] = ""
+# ------- Quotes -------
 
 
 class MeltQuoteState(Enum):
@@ -306,12 +298,14 @@ class MeltQuote(LedgerEvent):
     created_time: Union[int, None] = None
     paid_time: Union[int, None] = None
     fee_paid: int = 0
-    payment_preimage: str = ""
+    payment_preimage: Optional[str] = None
     expiry: Optional[int] = None
+    outputs: Optional[List[BlindedMessage]] = None
     change: Optional[List[BlindedSignature]] = None
+    mint: Optional[str] = None
 
     @classmethod
-    def from_row(cls, row: Row):
+    def from_row(cls, row: Row, change: Optional[List[BlindedSignature]] = None):
         try:
             created_time = int(row["created_time"]) if row["created_time"] else None
             paid_time = int(row["paid_time"]) if row["paid_time"] else None
@@ -323,10 +317,11 @@ class MeltQuote(LedgerEvent):
             paid_time = int(row["paid_time"].timestamp()) if row["paid_time"] else None
             expiry = int(row["expiry"].timestamp()) if row["expiry"] else None
 
-        # parse change from row as json
-        change = None
-        if row["change"]:
-            change = json.loads(row["change"])
+        payment_preimage = row.get("payment_preimage") or row.get("proof")  # type: ignore
+
+        outputs = None
+        if "outputs" in row.keys() and row["outputs"]:
+            outputs = json.loads(row["outputs"])
 
         return cls(
             quote=row["quote"],
@@ -336,13 +331,38 @@ class MeltQuote(LedgerEvent):
             unit=row["unit"],
             amount=row["amount"],
             fee_reserve=row["fee_reserve"],
-            state=MeltQuoteState[row["state"]],
+            state=MeltQuoteState(row["state"]),
             created_time=created_time,
             paid_time=paid_time,
             fee_paid=row["fee_paid"],
+            outputs=outputs,
             change=change,
             expiry=expiry,
-            payment_preimage=row["proof"],
+            payment_preimage=payment_preimage,
+        )
+
+    @classmethod
+    def from_resp_wallet(cls, melt_quote_resp, mint: str, unit: str, request: str):
+        # BEGIN: BACKWARDS COMPATIBILITY < 0.16.0: "paid" field to "state"
+        if melt_quote_resp.state is None:
+            if melt_quote_resp.paid is True:
+                melt_quote_resp.state = MeltQuoteState.paid
+            elif melt_quote_resp.paid is False:
+                melt_quote_resp.state = MeltQuoteState.unpaid
+        # END: BACKWARDS COMPATIBILITY < 0.16.0
+        return cls(
+            quote=melt_quote_resp.quote,
+            method="bolt11",
+            request=melt_quote_resp.request
+            or request,  # BACKWARDS COMPATIBILITY mint response < 0.17.0
+            checking_id="",
+            unit=melt_quote_resp.unit
+            or unit,  # BACKWARDS COMPATIBILITY mint response < 0.17.0
+            amount=melt_quote_resp.amount,
+            fee_reserve=melt_quote_resp.fee_reserve,
+            state=MeltQuoteState(melt_quote_resp.state),
+            mint=mint,
+            change=melt_quote_resp.change,
         )
 
     @property
@@ -406,6 +426,9 @@ class MintQuote(LedgerEvent):
     created_time: Union[int, None] = None
     paid_time: Union[int, None] = None
     expiry: Optional[int] = None
+    mint: Optional[str] = None
+    privkey: Optional[str] = None
+    pubkey: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: Row):
@@ -426,9 +449,29 @@ class MintQuote(LedgerEvent):
             checking_id=row["checking_id"],
             unit=row["unit"],
             amount=row["amount"],
-            state=MintQuoteState[row["state"]],
+            state=MintQuoteState(row["state"]),
             created_time=created_time,
             paid_time=paid_time,
+            pubkey=row["pubkey"] if "pubkey" in row.keys() else None,
+            privkey=row["privkey"] if "privkey" in row.keys() else None,
+        )
+
+    @classmethod
+    def from_resp_wallet(cls, mint_quote_resp, mint: str, amount: int, unit: str):
+        return cls(
+            quote=mint_quote_resp.quote,
+            method="bolt11",
+            request=mint_quote_resp.request,
+            checking_id="",
+            unit=mint_quote_resp.unit
+            or unit,  # BACKWARDS COMPATIBILITY mint response < 0.17.0
+            amount=mint_quote_resp.amount
+            or amount,  # BACKWARDS COMPATIBILITY mint response < 0.17.0
+            state=MintQuoteState(mint_quote_resp.state),
+            mint=mint,
+            expiry=mint_quote_resp.expiry,
+            created_time=int(time.time()),
+            pubkey=mint_quote_resp.pubkey,
         )
 
     @property
@@ -500,19 +543,22 @@ class Unit(Enum):
     msat = 1
     usd = 2
     eur = 3
-    gbp = 4
+    btc = 4
+    auth = 999
 
-    def str(self, amount: int) -> str:
+    def str(self, amount: int | float) -> str:
         if self == Unit.sat:
             return f"{amount} sat"
         elif self == Unit.msat:
             return f"{amount} msat"
-        elif self == Unit.usd or self == Unit.eur or self == Unit.gbp:
+        elif self == Unit.usd:
             return f"${amount/100:.2f} USD"
         elif self == Unit.eur:
             return f"{amount/100:.2f} EUR"
         elif self == Unit.btc:
             return f"{amount/1e8:.8f} BTC"
+        elif self == Unit.auth:
+            return f"{amount} AUTH"
         else:
             raise Exception("Invalid unit")
 
@@ -552,15 +598,19 @@ class Amount:
             return self.cents_to_usd()
         elif self.unit == Unit.sat:
             return self.sat_to_btc()
+        elif self.unit == Unit.msat:
+            return self.msat_to_btc()
         else:
             raise Exception("Amount must be in satoshis or cents")
 
     @classmethod
     def from_float(cls, amount: float, unit: Unit) -> "Amount":
         if unit == Unit.usd or unit == Unit.eur:
-            return cls(unit, int(amount * 100))
+            return cls(unit, int(round(amount * 100)))
         elif unit == Unit.sat:
-            return cls(unit, int(amount * 1e8))
+            return cls(unit, int(round(amount * 1e8)))
+        elif unit == Unit.msat:
+            return cls(unit, int(round(amount * 1e11)))
         else:
             raise Exception("Amount must be in satoshis or cents")
 
@@ -568,6 +618,12 @@ class Amount:
         if self.unit != Unit.sat:
             raise Exception("Amount must be in satoshis")
         return f"{self.amount/1e8:.8f}"
+
+    def msat_to_btc(self) -> str:
+        if self.unit != Unit.msat:
+            raise Exception("Amount must be in msat")
+        sat_amount = Amount(Unit.msat, self.amount).to(Unit.sat, round="up")
+        return f"{sat_amount.amount/1e8:.8f}"
 
     def cents_to_usd(self) -> str:
         if self.unit != Unit.usd and self.unit != Unit.eur:
@@ -579,6 +635,62 @@ class Amount:
 
     def __repr__(self):
         return self.unit.str(self.amount)
+
+    def __add__(self, other: "Amount | int") -> "Amount":
+        if isinstance(other, int):
+            return Amount(self.unit, self.amount + other)
+
+        if self.unit != other.unit:
+            raise Exception("Units must be the same")
+        return Amount(self.unit, self.amount + other.amount)
+
+    def __sub__(self, other: "Amount | int") -> "Amount":
+        if isinstance(other, int):
+            return Amount(self.unit, self.amount - other)
+
+        if self.unit != other.unit:
+            raise Exception("Units must be the same")
+        return Amount(self.unit, self.amount - other.amount)
+
+    def __mul__(self, other: int) -> "Amount":
+        return Amount(self.unit, self.amount * other)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, int):
+            return self.amount == other
+        if isinstance(other, Amount):
+            if self.unit != other.unit:
+                raise Exception("Units must be the same")
+            return self.amount == other.amount
+        return False
+
+    def __lt__(self, other: "Amount | int") -> bool:
+        if isinstance(other, int):
+            return self.amount < other
+        if self.unit != other.unit:
+            raise Exception("Units must be the same")
+        return self.amount < other.amount
+
+    def __le__(self, other: "Amount | int") -> bool:
+        if isinstance(other, int):
+            return self.amount <= other
+        if self.unit != other.unit:
+            raise Exception("Units must be the same")
+        return self.amount <= other.amount
+
+    def __gt__(self, other: "Amount | int") -> bool:
+        if isinstance(other, int):
+            return self.amount > other
+        if self.unit != other.unit:
+            raise Exception("Units must be the same")
+        return self.amount > other.amount
+
+    def __ge__(self, other: "Amount | int") -> bool:
+        if isinstance(other, int):
+            return self.amount >= other
+        if self.unit != other.unit:
+            raise Exception("Units must be the same")
+        return self.amount >= other.amount
 
 
 class Method(Enum):
@@ -615,7 +727,7 @@ class WalletKeyset:
         self.valid_from = valid_from
         self.valid_to = valid_to
         self.first_seen = first_seen
-        self.active = active
+        self.active = bool(active)
         self.mint_url = mint_url
         self.input_fee_ppk = input_fee_ppk
 
@@ -637,16 +749,17 @@ class WalletKeyset:
 
     def serialize(self):
         return json.dumps(
-            {amount: key.serialize().hex() for amount, key in self.public_keys.items()}
+            {amount: key.format().hex() for amount, key in self.public_keys.items()}
         )
 
     @classmethod
     def from_row(cls, row: Row):
         def deserialize(serialized: str) -> Dict[int, PublicKey]:
             return {
-                int(amount): PublicKey(bytes.fromhex(hex_key), raw=True)
+                int(amount): PublicKey(bytes.fromhex(hex_key))
                 for amount, hex_key in dict(json.loads(serialized)).items()
             }
+
         return cls(
             id=row["id"],
             unit=row["unit"],
@@ -683,6 +796,9 @@ class MintKeyset:
     valid_to: Optional[str] = None
     first_seen: Optional[str] = None
     version: Optional[str] = None
+    amounts: List[int]
+    balance: int
+    final_expiry: Optional[int] = None  # NEW: Final expiry timestamp for keyset v2
 
     duplicate_keyset_id: Optional[str] = None  # BACKWARDS COMPATIBILITY < 0.15.0
 
@@ -693,6 +809,7 @@ class MintKeyset:
         seed: Optional[str] = None,
         encrypted_seed: Optional[str] = None,
         seed_encryption_method: Optional[str] = None,
+        amounts: Optional[List[int]] = None,
         valid_from: Optional[str] = None,
         valid_to: Optional[str] = None,
         first_seen: Optional[str] = None,
@@ -701,7 +818,16 @@ class MintKeyset:
         version: Optional[str] = None,
         input_fee_ppk: Optional[int] = None,
         id: str = "",
+        balance: int = 0,
+        fees_paid: int = 0,
+        final_expiry: Optional[int] = None,
     ):
+        DEFAULT_SEED = "supersecretprivatekey"
+        if seed == DEFAULT_SEED:
+            raise Exception(
+                f"Seed is set to default value '{DEFAULT_SEED}'. Please change it."
+            )
+
         self.derivation_path = derivation_path
 
         if encrypted_seed and not settings.mint_seed_decryption_key:
@@ -715,22 +841,29 @@ class MintKeyset:
 
         assert self.seed, "seed not set"
 
+        if amounts:
+            self.amounts = amounts
+        else:
+            # use 2^n amounts by default
+            self.amounts = [2**i for i in range(settings.max_order)]
+
         self.id = id
         self.valid_from = valid_from
         self.valid_to = valid_to
         self.first_seen = first_seen
         self.active = bool(active) if active is not None else False
         self.version = version or settings.version
+        self.balance = balance
+        self.fees_paid = fees_paid
         self.input_fee_ppk = input_fee_ppk or 0
+        self.final_expiry = final_expiry
 
         if self.input_fee_ppk < 0:
             raise Exception("Input fee must be non-negative.")
 
-        # Handle the case where version is 'N/A' or other non-numeric values
-        if self.version and self.version.lower() != 'n/a':
-            self.version_tuple = tuple([int(i) for i in self.version.split(".")])
-        else:
-            self.version_tuple = tuple()  # or default to (0, 0, 0) if you prefer
+        self.version_tuple = tuple(
+            [int(i) for i in self.version.split(".")] if self.version else []
+        )
 
         # infer unit from derivation path
         if not unit:
@@ -760,11 +893,32 @@ class MintKeyset:
 
         logger.trace(f"Loaded keyset id: {self.id} ({self.unit.name})")
 
+    @classmethod
+    def from_row(cls, row: Row):
+        return cls(
+            id=row["id"],
+            derivation_path=row["derivation_path"],
+            seed=row["seed"],
+            encrypted_seed=row["encrypted_seed"],
+            seed_encryption_method=row["seed_encryption_method"],
+            valid_from=row["valid_from"],
+            valid_to=row["valid_to"],
+            first_seen=row["first_seen"],
+            active=bool(row["active"]),
+            unit=row["unit"],
+            version=row["version"],
+            input_fee_ppk=row["input_fee_ppk"],
+            amounts=json.loads(row["amounts"]),
+            balance=row["balance"],
+            fees_paid=row["fees_paid"],
+            final_expiry=row["final_expiry"],
+        )
+
     @property
     def public_keys_hex(self) -> Dict[int, str]:
         assert self.public_keys, "public keys not set"
         return {
-            int(amount): key.serialize().hex()
+            int(amount): key.format().hex()
             for amount, key in self.public_keys.items()
         }
 
@@ -785,24 +939,49 @@ class MintKeyset:
             self.private_keys = derive_keys_backwards_compatible_insecure_pre_0_12(
                 self.seed, self.derivation_path
             )
-            self.public_keys = derive_pubkeys(self.private_keys)  # type: ignore
+            self.public_keys = derive_pubkeys(self.private_keys, self.amounts)  # type: ignore
             logger.trace(
                 f"WARNING: Using weak key derivation for keyset {self.id} (backwards"
                 " compatibility < 0.12)"
             )
             self.id = id_in_db or derive_keyset_id_deprecated(self.public_keys)  # type: ignore
         elif self.version_tuple < (0, 15):
-            self.private_keys = derive_keys_sha256(self.seed, self.derivation_path)
+            self.private_keys = derive_keys_deprecated_pre_0_15(
+                self.seed, self.amounts, self.derivation_path
+            )
             logger.trace(
                 f"WARNING: Using non-bip32 derivation for keyset {self.id} (backwards"
                 " compatibility < 0.15)"
             )
-            self.public_keys = derive_pubkeys(self.private_keys)  # type: ignore
+            self.public_keys = derive_pubkeys(self.private_keys, self.amounts)  # type: ignore
             self.id = id_in_db or derive_keyset_id_deprecated(self.public_keys)  # type: ignore
+        elif self.version_tuple < (0, 20):
+            self.private_keys = derive_keys(
+                self.seed, self.derivation_path, self.amounts
+            )
+            self.public_keys = derive_pubkeys(self.private_keys, self.amounts)  # type: ignore
+            
+            if id_in_db:
+                # If loading from DB, preserve existing ID
+                self.id = id_in_db
+            else:
+                assert self.public_keys is not None
+                self.id = derive_keyset_id(self.public_keys)
+                logger.info(f"Generated keyset v1 ID: {self.id}")
         else:
-            self.private_keys = derive_keys(self.seed, self.derivation_path)
-            self.public_keys = derive_pubkeys(self.private_keys)  # type: ignore
-            self.id = id_in_db or derive_keyset_id(self.public_keys)  # type: ignore
+            self.private_keys = derive_keys(
+                self.seed, self.derivation_path, self.amounts
+            )
+            self.public_keys = derive_pubkeys(self.private_keys, self.amounts)  # type: ignore
+            
+            # KEYSETS V2: Use new keyset ID derivation
+            if id_in_db:
+                # If loading from DB, preserve existing ID
+                self.id = id_in_db
+            else:
+                assert self.public_keys is not None
+                self.id = derive_keyset_id_v2(self.public_keys, self.unit.name, self.final_expiry, self.input_fee_ppk)
+                logger.info(f"Generated keyset v2 ID: {self.id}")
 
 
 # ------- TOKEN -------
@@ -811,43 +990,38 @@ class MintKeyset:
 class Token(ABC):
     @property
     @abstractmethod
-    def proofs(self) -> List[Proof]:
-        ...
+    def proofs(self) -> List[Proof]: ...
 
     @property
     @abstractmethod
-    def amount(self) -> int:
-        ...
+    def amount(self) -> int: ...
 
     @property
     @abstractmethod
-    def mint(self) -> str:
-        ...
+    def mint(self) -> str: ...
 
     @property
     @abstractmethod
-    def keysets(self) -> List[str]:
-        ...
+    def keysets(self) -> List[str]: ...
 
     @property
     @abstractmethod
-    def memo(self) -> Optional[str]:
-        ...
+    def memo(self) -> Optional[str]: ...
 
     @memo.setter
     @abstractmethod
-    def memo(self, memo: Optional[str]):
-        ...
+    def memo(self, memo: Optional[str]): ...
 
     @property
     @abstractmethod
-    def unit(self) -> str:
-        ...
+    def unit(self) -> str: ...
 
     @unit.setter
     @abstractmethod
-    def unit(self, unit: str):
-        ...
+    def unit(self, unit: str): ...
+
+    @abstractmethod
+    def serialize_to_dict(self, include_dleq: bool): ...
 
 
 class TokenV3Token(BaseModel):
@@ -871,8 +1045,7 @@ class TokenV3(Token):
     _memo: Optional[str] = None
     _unit: str = "sat"
 
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
     @property
     def proofs(self) -> List[Proof]:
@@ -1129,7 +1302,7 @@ class TokenV4(Token):
         return cls(t=cls.t, d=cls.d, m=cls.m, u=cls.u)
 
     def serialize_to_dict(self, include_dleq=False):
-        return_dict: Dict[str, Any] = dict(t=[t.dict() for t in self.t])
+        return_dict: Dict[str, Any] = dict(t=[t.model_dump() for t in self.t])
         # strip dleq if needed
         if not include_dleq:
             for token in return_dict["t"]:
@@ -1216,4 +1389,72 @@ class TokenV4(Token):
             u=token_dict["u"],
             t=[TokenV4Token(**t) for t in token_dict["t"]],
             d=token_dict.get("d", None),
+        )
+
+
+class AuthProof(BaseModel):
+    """
+    Blind authentication token
+    """
+
+    id: str
+    secret: str  # secret
+    C: str  # signature
+    amount: int = 1  # default amount
+
+    prefix: ClassVar[str] = "authA"
+
+    @classmethod
+    def from_proof(cls, proof: Proof):
+        return cls(id=proof.id, secret=proof.secret, C=proof.C)
+
+    def to_base64(self):
+        serialize_dict = self.model_dump()
+        serialize_dict.pop("amount", None)
+        return (
+            self.prefix + base64.urlsafe_b64encode(json.dumps(serialize_dict).encode()).decode().rstrip("=")
+        )
+
+    @classmethod
+    def from_base64(cls, base64_str: str):
+        assert base64_str.startswith(cls.prefix), Exception(
+            f"Token prefix not valid. Expected {cls.prefix}."
+        )
+        base64_str = base64_str[len(cls.prefix) :]
+        # Re-add padding if stripped, as urlsafe_b64decode requires it
+        padded = base64_str + "=" * (-len(base64_str) % 4)
+        return cls.model_validate(json.loads(base64.urlsafe_b64decode(padded).decode()))
+
+    def to_proof(self):
+        return Proof(id=self.id, secret=self.secret, C=self.C, amount=self.amount)
+
+
+class WalletMint(BaseModel):
+    url: str
+    info: str
+    updated: Optional[Union[str, int]] = None
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+class MintBalanceLogEntry(BaseModel):
+    unit: Unit
+    backend_balance: Amount
+    keyset_balance: Amount
+    keyset_fees_paid: Amount
+    time: datetime.datetime
+
+    @classmethod
+    def from_row(cls, row: RowMapping):
+        return cls(
+            unit=Unit[row["unit"]],
+            backend_balance=Amount(
+                Unit[row["unit"]],
+                row["backend_balance"],
+            ),
+            keyset_balance=Amount(Unit[row["unit"]], row["keyset_balance"]),
+            keyset_fees_paid=Amount(Unit[row["unit"]], row["keyset_fees_paid"]),
+            time=row["time"],
         )

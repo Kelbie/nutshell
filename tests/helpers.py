@@ -20,6 +20,10 @@ async def assert_err(f, msg: Union[str, CashuError]):
     try:
         await f
     except Exception as exc:
+        if isinstance(msg, CashuError):
+            if msg.code == getattr(exc, "code", None):
+                return
+
         error_message: str = str(exc.args[0])
         if isinstance(msg, CashuError):
             if msg.detail not in error_message:
@@ -215,9 +219,9 @@ def pay_onchain(address: str, sats: int) -> str:
     return run_cmd(cmd)
 
 
-async def pay_if_regtest(bolt11: str):
+async def pay_if_regtest(bolt11: str) -> None:
     if is_regtest:
         pay_real_invoice(bolt11)
     if is_fake:
         await asyncio.sleep(settings.fakewallet_delay_incoming_payment or 0)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.5)

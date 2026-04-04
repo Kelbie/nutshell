@@ -3,16 +3,21 @@
 
 import asyncio
 import importlib
+from copy import copy
 from typing import Dict
 
 from loguru import logger
+
+import cashu.mint.management_rpc.management_rpc as management_rpc
 
 from ..core.base import Method, Unit
 from ..core.db import Database
 from ..core.migrations import migrate_databases
 from ..core.settings import settings
 from ..lightning.base import LightningBackend
-from ..mint import migrations
+from ..mint import migrations as mint_migrations
+from ..mint.auth import migrations as auth_migrations
+from ..mint.auth.server import AuthLedger
 from ..mint.crud import LedgerCrudSqlite
 from ..mint.ledger import Ledger
 
@@ -26,7 +31,6 @@ for key, value in settings.dict().items():
     if key in [
         "mint_private_key",
         "mint_seed_decryption_key",
-        "nostr_private_key",
         "mint_lnbits_key",
         "mint_blink_key",
         "mint_strike_key",
@@ -51,6 +55,11 @@ if settings.mint_backend_bolt11_sat:
         unit=Unit.sat
     )
     backends.setdefault(Method.bolt11, {})[Unit.sat] = backend_bolt11_sat
+if settings.mint_backend_bolt11_msat:
+    backend_bolt11_msat = getattr(wallets_module, settings.mint_backend_bolt11_msat)(
+        unit=Unit.msat
+    )
+    backends.setdefault(Method.bolt11, {})[Unit.msat] = backend_bolt11_msat
 if settings.mint_backend_bolt11_usd:
     backend_bolt11_usd = getattr(wallets_module, settings.mint_backend_bolt11_usd)(
         unit=Unit.usd
@@ -61,11 +70,6 @@ if settings.mint_backend_bolt11_eur:
         unit=Unit.eur
     )
     backends.setdefault(Method.bolt11, {})[Unit.eur] = backend_bolt11_eur
-if settings.mint_backend_bolt11_gbp:
-    backend_bolt11_gbp = getattr(wallets_module, settings.mint_backend_bolt11_gbp)(
-        unit=Unit.gbp
-    )
-    backends.setdefault(Method.bolt11, {})[Unit.gbp] = backend_bolt11_gbp
 if not backends:
     raise Exception("No backends are set.")
 
@@ -78,6 +82,15 @@ ledger = Ledger(
     seed_decryption_key=settings.mint_seed_decryption_key,
     derivation_path=settings.mint_derivation_path,
     backends=backends,
+    crud=LedgerCrudSqlite(),
+)
+
+# start auth ledger
+auth_ledger = AuthLedger(
+    db=Database("auth", settings.mint_auth_database),
+    seed="auth seed here",
+    amounts=[1],
+    derivation_path="m/0'/999'/0'",
     crud=LedgerCrudSqlite(),
 )
 
@@ -98,8 +111,17 @@ async def rotate_keys(n_seconds=60):
         await asyncio.sleep(n_seconds)
 
 
-async def start_mint_init():
-    await migrate_databases(ledger.db, migrations)
+async def start_auth():
+    await migrate_databases(auth_ledger.db, auth_migrations)
+    logger.info("Starting auth ledger.")
+    await auth_ledger.init_keysets()
+    await auth_ledger.init_auth()
+    logger.info("Auth ledger started.")
+
+
+async def start_mint():
+    await migrate_databases(ledger.db, mint_migrations)
+    logger.info("Starting mint ledger.")
     await ledger.startup_ledger()
     logger.info("Mint started.")
     # asyncio.create_task(rotate_keys())
@@ -109,3 +131,16 @@ async def shutdown_mint():
     await ledger.shutdown_ledger()
     logger.info("Mint shutdown.")
     logger.remove()
+
+
+rpc_server = None
+
+
+async def start_management_rpc():
+    global rpc_server
+    rpc_server = await management_rpc.serve(copy(ledger))
+
+
+async def shutdown_management_rpc():
+    if rpc_server:
+        await management_rpc.shutdown(rpc_server)

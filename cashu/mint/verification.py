@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 from loguru import logger
 
@@ -6,26 +6,31 @@ from ..core.base import (
     BlindedMessage,
     BlindedSignature,
     Method,
-    MintKeyset,
+    MintQuote,
     Proof,
     Unit,
 )
 from ..core.crypto import b_dhke
 from ..core.crypto.secp import PublicKey
-from ..core.db import Connection, Database
+from ..core.db import Connection
 from ..core.errors import (
+    InvalidProofsError,
     NoSecretInProofsError,
     NotAllowedError,
+    OutputsAlreadySignedError,
+    OutputsArePendingError,
     SecretTooLongError,
+    TransactionDuplicateInputsError,
+    TransactionDuplicateOutputsError,
     TransactionError,
+    TransactionMultipleUnitsError,
     TransactionUnitError,
+    TransactionUnitMismatchError,
+    WitnessTooLongError,
 )
+from ..core.nuts import nut20
 from ..core.settings import settings
-from ..lightning.base import LightningBackend
-from ..mint.crud import LedgerCrud
 from .conditions import LedgerSpendingConditions
-from .db.read import DbReadHelper
-from .db.write import DbWriteHelper
 from .protocols import SupportsBackends, SupportsDb, SupportsKeysets
 
 
@@ -33,14 +38,6 @@ class LedgerVerification(
     LedgerSpendingConditions, SupportsKeysets, SupportsDb, SupportsBackends
 ):
     """Verification functions for the ledger."""
-
-    keyset: MintKeyset
-    keysets: Dict[str, MintKeyset]
-    crud: LedgerCrud
-    db: Database
-    db_read: DbReadHelper
-    db_write: DbWriteHelper
-    lightning: Dict[Unit, LightningBackend]
 
     async def verify_inputs_and_outputs(
         self,
@@ -63,7 +60,25 @@ class LedgerVerification(
             Exception: Duplicate proofs provided.
             Exception: BDHKE verification failed.
         """
-        # Verify inputs
+        # 1. Verify inputs
+        await self._verify_inputs(proofs)
+
+        # If no outputs are provided, no further checks are needed
+        if outputs is None:
+            return
+
+        # 2. Verify outputs
+        await self._verify_outputs(outputs, conn=conn)
+
+        # 3. Verify inputs and outputs together
+        self._verify_inputs_and_outputs_together(proofs, outputs)
+
+    async def _verify_inputs(
+        self,
+        proofs: List[Proof],
+    ):
+        """Verify that the proofs are valid and can be spent."""
+        logger.trace(f"Verifying {len(proofs)} proofs.")
         if not proofs:
             raise TransactionError("no proofs provided.")
         # Verify amounts of inputs
@@ -72,50 +87,43 @@ class LedgerVerification(
         # Verify secret criteria
         if not all([self._verify_secret_criteria(p) for p in proofs]):
             raise TransactionError("secrets do not match criteria.")
+        # Verify witness criteria
+        if not all([self._verify_input_witness_criteria(p) for p in proofs]):
+            raise TransactionError("input witness data does not match criteria.")
         # verify that only unique proofs were used
         if not self._verify_no_duplicate_proofs(proofs):
-            raise TransactionError("duplicate proofs.")
+            raise TransactionDuplicateInputsError()
         # Verify ecash signatures
         if not all([self._verify_proof_bdhke(p) for p in proofs]):
-            raise TransactionError("could not verify proofs.")
-        # Verify input spending conditions
+            raise InvalidProofsError()
+        # Verify SIG_INPUTS spending conditions
         if not all([self._verify_input_spending_conditions(p) for p in proofs]):
             raise TransactionError("validation of input spending conditions failed.")
+        # Verify proofs are not already spent (raises ProofsAlreadySpentError)
+        await self.db_read._verify_proofs_spendable(proofs)
 
-        if outputs is None:
-            # If no outputs are provided, we are melting
-            return
+        logger.trace(f"Verified {len(proofs)} proofs.")
 
-        # Verify input and output amounts
-        self._verify_equation_balanced(proofs, outputs)
-
-        # Verify outputs
-        await self._verify_outputs(outputs, conn=conn)
-
-        # Verify inputs and outputs together
-        if not self._verify_input_output_amounts(proofs, outputs):
-            raise TransactionError("input amounts less than output.")
-        # Verify that input keyset units are the same as output keyset unit
-        # We have previously verified that all outputs have the same keyset id in `_verify_outputs`
-        assert outputs[0].id, "output id not set"
-        if not all(
-            [
-                self.keysets[p.id].unit == self.keysets[outputs[0].id].unit
-                for p in proofs
-            ]
-        ):
-            raise TransactionError("input and output keysets have different units.")
-
-        # Verify output spending conditions
-        if outputs and not self._verify_output_spending_conditions(proofs, outputs):
-            raise TransactionError("validation of output spending conditions failed.")
+    def _verify_proofs_unit(self, proofs: List[Proof], expected_unit: Unit) -> None:
+        """Verifies that all proofs have the expected unit and valid keysets."""
+        if not proofs:
+            raise TransactionError("no proofs provided.")
+        for p in proofs:
+            if p.id not in self.keysets:
+                raise TransactionError(f"keyset {p.id} unknown")
+            if self.keysets[p.id].unit != expected_unit:
+                raise TransactionError(
+                    f"proof unit {self.keysets[p.id].unit.name} does not match quote unit {expected_unit.name}"
+                )
 
     async def _verify_outputs(
         self,
         outputs: List[BlindedMessage],
         skip_amount_check=False,
+        expected_unit: Optional[Unit] = None,
         conn: Optional[Connection] = None,
     ):
+
         """Verify that the outputs are valid."""
         logger.trace(f"Verifying {len(outputs)} outputs.")
         if not outputs:
@@ -128,6 +136,10 @@ class LedgerVerification(
             raise TransactionError("keyset id unknown.")
         if not self.keysets[outputs[0].id].active:
             raise TransactionError("keyset id inactive.")
+        if expected_unit and self.keysets[outputs[0].id].unit != expected_unit:
+            raise TransactionError(
+                f"output unit {self.keysets[outputs[0].id].unit.name} does not match quote unit {expected_unit.name}"
+            )
         # Verify amounts of outputs
         # we skip the amount check for NUT-8 change outputs (which can have amount 0)
         if not skip_amount_check:
@@ -135,32 +147,57 @@ class LedgerVerification(
                 raise TransactionError("invalid amount.")
         # verify that only unique outputs were used
         if not self._verify_no_duplicate_outputs(outputs):
-            raise TransactionError("duplicate outputs.")
-        # verify that outputs have not been signed previously
-        signed_before = await self._check_outputs_issued_before(outputs, conn)
-        if any(signed_before):
-            raise TransactionError("outputs have already been signed before.")
+            raise TransactionDuplicateOutputsError()
+        # verify that outputs have not been stored or signed before
+        stored_before = await self._check_outputs_pending_or_issued_before(
+            outputs, conn
+        )
+        if stored_before:
+            signed_outputs = [o for o in stored_before if o.C_ is not None]
+            if any(o.C_ for o in signed_outputs):
+                raise OutputsAlreadySignedError()
+            else:
+                raise OutputsArePendingError()
+
         logger.trace(f"Verified {len(outputs)} outputs.")
 
-    async def _check_outputs_issued_before(
+    def _verify_inputs_and_outputs_together(
+        self,
+        proofs: List[Proof],
+        outputs: List[BlindedMessage],
+    ):
+        """Verify criteria that depend on both inputs and outputs."""
+        # Verify that inputs > outputs (excluding fees)
+        self._verify_input_output_amounts(proofs, outputs)
+
+        # Verify input and output amounts are balanced (inputs = outputs + fees)
+        self._verify_equation_balanced(proofs, outputs)
+
+        # Verify that input keyset units are the same as output keyset unit
+        self._verify_units_match(proofs, outputs)
+
+        # Verify SIG_ALL spending conditions
+        self._verify_input_output_spending_conditions(proofs, outputs)
+
+    async def _check_outputs_pending_or_issued_before(
         self,
         outputs: List[BlindedMessage],
         conn: Optional[Connection] = None,
-    ) -> List[bool]:
-        """Checks whether the provided outputs have previously been signed by the mint
-        (which would lead to a duplication error later when trying to store these outputs again).
+    ) -> List[BlindedMessage]:
+        """Checks whether the provided outputs have previously stored (as blinded messages,
+        or signed as blind signatures) by the mint.
 
         Args:
             outputs (List[BlindedMessage]): Outputs to check
 
         Returns:
-            result (List[bool]): Whether outputs are already present in the database.
+            result (List[BlindedMessage]): List of booleans indicating whether each output was already stored before
         """
         async with self.db.get_connection(conn) as conn:
-            promises = await self.crud.get_promises(
+            promises = await self.crud.get_outputs(
                 b_s=[output.B_ for output in outputs], db=self.db, conn=conn
             )
-        return [True if promise else False for promise in promises]
+        return promises
 
     def _verify_secret_criteria(self, proof: Proof) -> Literal[True]:
         """Verifies that a secret is present and is not too long (DOS prevention)."""
@@ -172,17 +209,27 @@ class LedgerVerification(
             )
         return True
 
+    def _verify_input_witness_criteria(self, proof: Proof) -> Literal[True]:
+        """Verifies max length of input witness data"""
+        if (
+            proof.witness is not None
+            and len(proof.witness) > settings.mint_max_witness_length
+        ):
+            raise WitnessTooLongError(
+                f"input witness data too long. max: {settings.mint_max_witness_length}"
+            )
+        return True
+
     def _verify_proof_bdhke(self, proof: Proof) -> bool:
         """Verifies that the proof of promise was issued by this ledger."""
         assert proof.id in self.keysets, f"keyset {proof.id} unknown"
         logger.trace(
-            f"Validating proof {proof.secret} with keyset"
-            f" {self.keysets[proof.id].id}."
+            f"Validating proof {proof.secret} with keyset {self.keysets[proof.id].id}."
         )
         # use the appropriate active keyset for this proof.id
         private_key_amount = self.keysets[proof.id].private_keys[proof.amount]
 
-        C = PublicKey(bytes.fromhex(proof.C), raw=True)
+        C = PublicKey(bytes.fromhex(proof.C))
         valid = b_dhke.verify(private_key_amount, C, proof.secret)
         if valid:
             logger.trace("Proof verified.")
@@ -192,11 +239,14 @@ class LedgerVerification(
 
     def _verify_input_output_amounts(
         self, inputs: List[Proof], outputs: List[BlindedMessage]
-    ) -> bool:
+    ) -> None:
         """Verifies that inputs have at least the same amount as outputs"""
         input_amount = sum([p.amount for p in inputs])
         output_amount = sum([o.amount for o in outputs])
-        return input_amount >= output_amount
+        if not input_amount >= output_amount:
+            raise TransactionError(
+                f"input amounts ({input_amount}) less than output amounts ({output_amount})."
+            )
 
     def _verify_no_duplicate_proofs(self, proofs: List[Proof]) -> bool:
         secrets = [p.secret for p in proofs]
@@ -208,6 +258,20 @@ class LedgerVerification(
         B_s = [od.B_ for od in outputs]
         if len(B_s) != len(list(set(B_s))):
             return False
+        return True
+
+    def _verify_inputs_outputs_units_match(
+        self, proofs: List[Proof], outputs: List[BlindedMessage]
+    ) -> bool:
+        """Verifies that the units of the inputs and outputs match."""
+        units_proofs = [self.keysets[p.id].unit for p in proofs]
+        units_outputs = [self.keysets[o.id].unit for o in outputs]
+        if not len(set(units_proofs)) == 1:
+            raise TransactionMultipleUnitsError("inputs have different units.")
+        if not len(set(units_outputs)) == 1:
+            raise TransactionMultipleUnitsError("outputs have different units.")
+        if not units_proofs[0] == units_outputs[0]:
+            raise TransactionUnitMismatchError()
         return True
 
     def _verify_amount(self, amount: int) -> int:
@@ -226,11 +290,11 @@ class LedgerVerification(
         units_proofs = [self.keysets[p.id].unit for p in proofs]
         units_outputs = [self.keysets[o.id].unit for o in outs if o.id]
         if not len(set(units_proofs)) == 1:
-            raise TransactionUnitError("inputs have different units.")
+            raise TransactionMultipleUnitsError("inputs have different units.")
         if not len(set(units_outputs)) == 1:
-            raise TransactionUnitError("outputs have different units.")
+            raise TransactionMultipleUnitsError("outputs have different units.")
         if not units_proofs[0] == units_outputs[0]:
-            raise TransactionUnitError("input and output keysets have different units.")
+            raise TransactionUnitMismatchError()
         return units_proofs[0]
 
     def get_fees_for_proofs(self, proofs: List[Proof]) -> int:
@@ -277,3 +341,16 @@ class LedgerVerification(
             )
 
         return unit, method
+
+    def _verify_mint_quote_witness(
+        self,
+        quote: MintQuote,
+        outputs: List[BlindedMessage],
+        signature: Optional[str],
+    ) -> bool:
+        """Verify signature on quote id and outputs"""
+        if not quote.pubkey:
+            return True
+        if not signature:
+            return False
+        return nut20.verify_mint_quote(quote.quote, outputs, quote.pubkey, signature)

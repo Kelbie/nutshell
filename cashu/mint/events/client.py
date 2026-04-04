@@ -2,7 +2,7 @@ import asyncio
 import json
 from typing import List, Union
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 from loguru import logger
 
 from ...core.base import MeltQuote, MintQuote, ProofState
@@ -89,7 +89,7 @@ class LedgerEventClientManager:
 
             # Parse the JSONRPCRequest
             try:
-                req = JSONRPCRequest.parse_obj(data)
+                req = JSONRPCRequest.model_validate(data)
             except Exception as e:
                 err = JSONRPCErrorResponse(
                     error=JSONRPCError(
@@ -118,10 +118,13 @@ class LedgerEventClientManager:
 
             # Handle the request
             try:
-                logger.debug(f"Request: {req.json()}")
+                logger.debug(f"Request: {req.model_dump_json()}")
                 resp = await self._handle_request(req)
                 # Send the response
                 await self._send_msg(resp)
+            except WebSocketDisconnect as e:
+                logger.debug(f"Websocket disconnected: {e}")
+                raise e
             except Exception as e:
                 err = JSONRPCErrorResponse(
                     error=JSONRPCError(
@@ -136,7 +139,7 @@ class LedgerEventClientManager:
     async def _handle_request(self, data: JSONRPCRequest) -> JSONRPCResponse:
         logger.debug(f"Received websocket message: {data}")
         if data.method == JSONRPCMethods.SUBSCRIBE.value:
-            subscribe_params = JSONRPCSubscribeParams.parse_obj(data.params)
+            subscribe_params = JSONRPCSubscribeParams.model_validate(data.params)
             self.add_subscription(
                 subscribe_params.kind, subscribe_params.filters, subscribe_params.subId
             )
@@ -144,30 +147,30 @@ class LedgerEventClientManager:
                 status=JSONRPCStatus.OK,
                 subId=subscribe_params.subId,
             )
-            return JSONRPCResponse(result=result.dict(), id=data.id)
+            return JSONRPCResponse(result=result.model_dump(), id=data.id)
         elif data.method == JSONRPCMethods.UNSUBSCRIBE.value:
-            unsubscribe_params = JSONRPCUnsubscribeParams.parse_obj(data.params)
+            unsubscribe_params = JSONRPCUnsubscribeParams.model_validate(data.params)
             self.remove_subscription(unsubscribe_params.subId)
             result = JSONRRPCSubscribeResponse(
                 status=JSONRPCStatus.OK,
                 subId=unsubscribe_params.subId,
             )
-            return JSONRPCResponse(result=result.dict(), id=data.id)
+            return JSONRPCResponse(result=result.model_dump(), id=data.id)
         else:
             raise ValueError(f"Invalid method: {data.method}")
 
     async def _send_obj(self, data: dict, subId: str):
         resp = JSONRPCNotification(
             method=JSONRPCMethods.SUBSCRIBE.value,
-            params=JSONRPCNotficationParams(subId=subId, payload=data).dict(),
+            params=JSONRPCNotficationParams(subId=subId, payload=data).model_dump(),
         )
         await self._send_msg(resp)
 
     async def _send_msg(
         self, data: Union[JSONRPCResponse, JSONRPCNotification, JSONRPCErrorResponse]
     ):
-        logger.debug(f"Sending websocket message: {data.json()}")
-        await self.websocket.send_text(data.json())
+        logger.debug(f"Sending websocket message: {data.model_dump_json()}")
+        await self.websocket.send_text(data.model_dump_json())
 
     def add_subscription(
         self,
@@ -181,13 +184,11 @@ class LedgerEventClientManager:
         if len(self.subscriptions[kind]) >= self.max_subscriptions:
             raise ValueError("Max subscriptions reached")
 
-        for filter in filters:
-            if filter not in self.subscriptions:
-                self.subscriptions[kind][filter] = []
-            logger.debug(f"Adding subscription {subId} for filter {filter}")
-            self.subscriptions[kind][filter].append(subId)
+        for f in filters:
+            logger.debug(f"Adding subscription {subId} for filter {f}")
+            self.subscriptions[kind].setdefault(f, []).append(subId)
             # Initialize the subscription
-            asyncio.create_task(self._init_subscription(subId, filter, kind))
+            asyncio.create_task(self._init_subscription(subId, f, kind))
 
     def remove_subscription(self, subId: str) -> None:
         for kind, sub_filters in self.subscriptions.items():
@@ -203,11 +204,11 @@ class LedgerEventClientManager:
 
     def serialize_event(self, event: LedgerEvent) -> dict:
         if isinstance(event, MintQuote):
-            return_dict = PostMintQuoteResponse.parse_obj(event.dict()).dict()
+            return_dict = PostMintQuoteResponse.from_mint_quote(event).model_dump()
         elif isinstance(event, MeltQuote):
-            return_dict = PostMeltQuoteResponse.parse_obj(event.dict()).dict()
+            return_dict = PostMeltQuoteResponse.from_melt_quote(event).model_dump()
         elif isinstance(event, ProofState):
-            return_dict = event.dict(exclude_unset=True, exclude_none=True)
+            return_dict = event.model_dump(exclude_unset=True, exclude_none=True)
         return return_dict
 
     async def _init_subscription(
@@ -218,14 +219,14 @@ class LedgerEventClientManager:
                 quote_id=filter, db=self.db_read.db
             )
             if mint_quote:
-                await self._send_obj(mint_quote.dict(), subId)
+                await self._send_obj(PostMintQuoteResponse.from_mint_quote(mint_quote).model_dump(), subId)
         elif kind == JSONRPCSubscriptionKinds.BOLT11_MELT_QUOTE:
             melt_quote = await self.db_read.crud.get_melt_quote(
                 quote_id=filter, db=self.db_read.db
             )
             if melt_quote:
-                await self._send_obj(melt_quote.dict(), subId)
+                await self._send_obj(PostMeltQuoteResponse.from_melt_quote(melt_quote).model_dump(), subId)
         elif kind == JSONRPCSubscriptionKinds.PROOF_STATE:
             proofs = await self.db_read.get_proofs_states(Ys=[filter])
             if len(proofs):
-                await self._send_obj(proofs[0].dict(), subId)
+                await self._send_obj(proofs[0].model_dump(), subId)

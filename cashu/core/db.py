@@ -1,13 +1,12 @@
 import asyncio
 import datetime
 import os
-import re
 import time
 from contextlib import asynccontextmanager
 from typing import Optional, Union
 
 from loguru import logger
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
@@ -65,6 +64,7 @@ class Compat:
     def table_with_schema(self, table: str):
         return f"{self.references_schema if self.schema else ''}{table}"
 
+
 # https://docs.sqlalchemy.org/en/14/core/connections.html#sqlalchemy.engine.CursorResult
 class Connection(Compat):
     def __init__(self, conn: AsyncSession, txn, typ, name, schema):
@@ -82,7 +82,9 @@ class Connection(Compat):
 
     async def fetchall(self, query: str, values: dict = {}):
         result = await self.conn.execute(self.rewrite_query(query), values)
-        return [r._mapping for r in result.all()] # will return [] if result list is empty
+        return [
+            r._mapping for r in result.all()
+        ]  # will return [] if result list is empty
 
     async def fetchone(self, query: str, values: dict = {}):
         result = await self.conn.execute(self.rewrite_query(query), values)
@@ -134,13 +136,27 @@ class Database(Compat):
         if not settings.db_connection_pool:
             kwargs["poolclass"] = NullPool
         elif self.type == POSTGRES:
-            kwargs["poolclass"] = AsyncAdaptedQueuePool # type: ignore[assignment]
-            kwargs["pool_size"] = 50                    # type: ignore[assignment]
-            kwargs["max_overflow"] = 100                # type: ignore[assignment]
+            kwargs["poolclass"] = AsyncAdaptedQueuePool  # type: ignore[assignment]
+            kwargs["pool_size"] = 50  # type: ignore[assignment]
+            kwargs["max_overflow"] = 100  # type: ignore[assignment]
 
         self.engine = create_async_engine(database_uri, **kwargs)
+
+        # Ensure SQLite enforces foreign keys on every connection
+        if self.type == SQLITE:
+
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def _set_sqlite_pragma(dbapi_connection, connection_record):
+                try:
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute("PRAGMA foreign_keys=ON;")
+                    cursor.execute("PRAGMA journal_mode=WAL;")
+                    cursor.close()
+                except Exception as e:
+                    logger.warning(f"Could not enable SQLite PRAGMAs: {e}")
+
         self.async_session = sessionmaker(
-            self.engine,
+            self.engine,  # type: ignore
             expire_on_commit=False,
             class_=AsyncSession,  # type: ignore
         )
@@ -151,6 +167,7 @@ class Database(Compat):
         conn: Optional[Connection] = None,
         lock_table: Optional[str] = None,
         lock_select_statement: Optional[str] = None,
+        lock_parameters: Optional[dict] = None,
         lock_timeout: Optional[float] = None,
     ):
         """Either yield the existing database connection (passthrough) or create a new one.
@@ -159,6 +176,7 @@ class Database(Compat):
             conn (Optional[Connection], optional): Connection object. Defaults to None.
             lock_table (Optional[str], optional): Table to lock. Defaults to None.
             lock_select_statement (Optional[str], optional): Lock select statement. Defaults to None.
+            lock_parameters (Optional[dict], optional): Parameters for the lock select statement. Defaults to None.
             lock_timeout (Optional[float], optional): Lock timeout. Defaults to None.
 
         Yields:
@@ -171,7 +189,7 @@ class Database(Compat):
         else:
             logger.trace("get_connection: Creating new connection")
             async with self.connect(
-                lock_table, lock_select_statement, lock_timeout
+                lock_table, lock_select_statement, lock_parameters, lock_timeout
             ) as new_conn:
                 yield new_conn
 
@@ -180,6 +198,7 @@ class Database(Compat):
         self,
         lock_table: Optional[str] = None,
         lock_select_statement: Optional[str] = None,
+        lock_parameters: Optional[dict] = None,
         lock_timeout: Optional[float] = None,
     ):
         async def _handle_lock_retry(retry_delay, timeout, start_time) -> float:
@@ -208,7 +227,7 @@ class Database(Compat):
                     wconn = Connection(session, txn, self.type, self.name, self.schema)
                     if lock_table:
                         await self.acquire_lock(
-                            wconn, lock_table, lock_select_statement
+                            wconn, lock_table, lock_select_statement, lock_parameters
                         )
                     logger.trace(
                         f"> Yielding connection. Lock: {lock_table} - trial {trial} ({random_int})"
@@ -225,14 +244,11 @@ class Database(Compat):
                     )
                 else:
                     logger.error(f"Error in session trial: {trial} ({random_int}): {e}")
-                    raise e
+                    raise
             finally:
                 logger.trace(f"Closing session trial: {trial} ({random_int})")
                 await session.close()
-                # if not inherited:
-                #     logger.trace("Closing session")
-                #     await session.close()
-                #     self._connection = None
+
         raise Exception(
             f"failed to acquire database lock on {lock_table} after {timeout}s and {trial} trials ({random_int})"
         )
@@ -242,6 +258,7 @@ class Database(Compat):
         wconn: Connection,
         lock_table: str,
         lock_select_statement: Optional[str] = None,
+        lock_parameters: Optional[dict] = None,
     ):
         """Acquire a lock on a table or a row in a table.
 
@@ -249,20 +266,15 @@ class Database(Compat):
             wconn (Connection): Connection object.
             lock_table (str): Table to lock.
             lock_select_statement (Optional[str], optional):
-            lock_timeout (Optional[float], optional):
-
-        Raises:
-            Exception: _description_
+            lock_parameters (Optional[dict], optional): Parameters to pass to the lock select query.
         """
-        if lock_select_statement:
-            assert (
-                len(re.findall(r"^[^=]+='[^']+'$", lock_select_statement)) == 1
-            ), "lock_select_statement must have exactly one {column}='{value}' pattern."
         try:
             logger.trace(
-                f"Acquiring lock on {lock_table} with statement {self.lock_table(lock_table, lock_select_statement)}"
+                f"Acquiring lock on {lock_table} with statement {self.lock_table(lock_table, lock_select_statement)} parameters: {lock_parameters}"
             )
-            await wconn.execute(self.lock_table(lock_table, lock_select_statement))
+            await wconn.execute(
+                self.lock_table(lock_table, lock_select_statement), lock_parameters or {}
+            )
             logger.trace(f"Success: Acquired lock on {lock_table}")
             return
         except Exception as e:
@@ -339,11 +351,21 @@ class Database(Compat):
             raise Exception("Timestamp is None")
         return timestamp
 
-    def to_timestamp(self, timestamp_str: str) -> Union[str, datetime.datetime]:
-        if not timestamp_str:
-            timestamp_str = self.timestamp_now_str()
+    def to_timestamp(
+        self, timestamp: Union[str, datetime.datetime]
+    ) -> Union[str, datetime.datetime, None]:
+        if not timestamp:
+            return None
         if self.type in {POSTGRES, COCKROACH}:
-            return datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            # return datetime.datetime
+            if isinstance(timestamp, datetime.datetime):
+                return timestamp
+            elif isinstance(timestamp, str):
+                return datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
         elif self.type == SQLITE:
-            return timestamp_str
+            # return str
+            if isinstance(timestamp, datetime.datetime):
+                return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            elif isinstance(timestamp, str):
+                return timestamp
         return "<nothing>"

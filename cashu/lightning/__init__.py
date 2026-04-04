@@ -13,7 +13,6 @@ backend_settings = [
     settings.mint_backend_bolt11_sat,
     settings.mint_backend_bolt11_usd,
     settings.mint_backend_bolt11_eur,
-    settings.mint_backend_bolt11_gbp,
 ]
 if all([s is None for s in backend_settings]):
     raise Exception(

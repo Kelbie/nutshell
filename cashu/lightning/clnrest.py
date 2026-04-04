@@ -80,7 +80,7 @@ class CLNRestWallet(LightningBackend):
 
         self.cert = settings.mint_clnrest_cert or False
         self.client = httpx.AsyncClient(
-            base_url=self.url, verify=self.cert, headers=self.auth
+            base_url=self.url, verify=self.cert, headers=self.auth, timeout=None,
         )
         self.last_pay_index = 0
 
@@ -103,14 +103,14 @@ class CLNRestWallet(LightningBackend):
                 error_message=(
                     f"Failed to connect to {self.url}, got: '{error_message}...'"
                 ),
-                balance=0,
+                balance=Amount(self.unit, 0),
             )
 
         data = r.json()
         if len(data) == 0:
-            return StatusResponse(error_message="no data", balance=0)
+            return StatusResponse(error_message="no data", balance=Amount(self.unit, 0))
         balance_msat = int(sum([c["our_amount_msat"] for c in data["channels"]]))
-        return StatusResponse(balance=balance_msat)
+        return StatusResponse(balance=Amount(self.unit, balance_msat // 1000))
 
     async def create_invoice(
         self,
@@ -289,7 +289,19 @@ class CLNRestWallet(LightningBackend):
         data = r.json()
         if r.is_error or "message" in data:
             raise Exception("error in cln response")
-        self.last_pay_index = data["invoices"][-1]["pay_index"]
+        last_invoice_paid_invoice = next(
+            (i for i in reversed(data["invoices"]) if i["status"] == "paid"), None
+        )
+        last_pay_index = (
+            last_invoice_paid_invoice.get("pay_index")
+            if last_invoice_paid_invoice
+            else 0
+        )
+        self.last_pay_index = last_pay_index
+        
+        retry_delay = 0
+        max_retry_delay = settings.mint_retry_exponential_backoff_max_delay
+        
         while True:
             try:
                 url = "/v1/waitanyinvoice"
@@ -301,6 +313,8 @@ class CLNRestWallet(LightningBackend):
                     },
                     timeout=None,
                 ) as r:
+                    # Reset retry delay on successful connection
+                    retry_delay = 0
                     async for line in r.aiter_lines():
                         inv = json.loads(line)
                         if "code" in inv and "message" in inv:
@@ -308,9 +322,13 @@ class CLNRestWallet(LightningBackend):
                             raise Exception(inv["message"])
                         try:
                             paid = inv["status"] == "paid"
-                            self.last_pay_index = inv["pay_index"]
                             if not paid:
                                 continue
+                            last_pay_index = inv.get("pay_index")
+                            if not last_pay_index:
+                                logger.error(f"missing pay_index in invoice: {inv}")
+                                raise Exception("missing pay_index in invoice")
+                            self.last_pay_index = last_pay_index
                         except Exception as e:
                             logger.error(f"Error in paid_invoices_stream: {e}")
                             continue
@@ -320,11 +338,14 @@ class CLNRestWallet(LightningBackend):
                             yield payment_hash
 
             except Exception as exc:
-                logger.debug(
-                    f"lost connection to clnrest invoices stream: '{exc}', "
-                    "reconnecting..."
+                logger.error(
+                    f"lost connection to clnrest invoices stream: '{exc}', retrying in {retry_delay}"
+                    " seconds"
                 )
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(retry_delay)
+                
+                # Exponential backoff
+                retry_delay = max(settings.mint_retry_exponential_backoff_base_delay, min(retry_delay * 2, max_retry_delay))
 
     async def get_payment_quote(
         self, melt_quote: PostMeltQuoteRequest
@@ -332,13 +353,9 @@ class CLNRestWallet(LightningBackend):
         invoice_obj = decode(melt_quote.request)
         assert invoice_obj.amount_msat, "invoice has no amount."
         assert invoice_obj.amount_msat > 0, "invoice has 0 amount."
-        amount_msat = invoice_obj.amount_msat
-        if melt_quote.is_mpp:
-            amount_msat = (
-                Amount(Unit[melt_quote.unit], melt_quote.mpp_amount)
-                .to(Unit.msat)
-                .amount
-            )
+        amount_msat = (
+            melt_quote.mpp_amount if melt_quote.is_mpp else (invoice_obj.amount_msat)
+        )
         fees_msat = fee_reserve(amount_msat)
         fees = Amount(unit=Unit.msat, amount=fees_msat)
         amount = Amount(unit=Unit.msat, amount=amount_msat)

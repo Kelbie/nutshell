@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Request
 from loguru import logger
 
-from ..core.base import BlindedMessage, BlindedSignature
+from ..core.base import BlindedMessage, BlindedSignature, Unit
 from ..core.errors import CashuError
 from ..core.models import (
     CheckFeesRequest_deprecated,
@@ -45,18 +45,13 @@ async def info() -> GetInfoResponse_deprecated:
     logger.trace("> GET /info")
     return GetInfoResponse_deprecated(
         name=settings.mint_info_name,
-        pubkey=ledger.pubkey.serialize().hex() if ledger.pubkey else None,
+        pubkey=ledger.pubkey.format().hex() if ledger.pubkey else None,
         version=f"Nutshell/{settings.version}",
         description=settings.mint_info_description,
         description_long=settings.mint_info_description_long,
         contact=settings.mint_info_contact,
         nuts=["NUT-07", "NUT-08", "NUT-09"],
         motd=settings.mint_info_motd,
-        parameter={
-            "max_peg_in": settings.mint_max_peg_in,
-            "max_peg_out": settings.mint_max_peg_out,
-            "peg_out_only": settings.mint_peg_out_only,
-        },
     )
 
 
@@ -75,8 +70,10 @@ async def keys_deprecated() -> Dict[str, str]:
     """This endpoint returns a dictionary of all supported token values of the mint and their associated public key."""
     logger.trace("> GET /keys")
     keyset = ledger.get_keyset()
-    keys = KeysResponse_deprecated.parse_obj(keyset)
-    return keys.__root__
+    keys = KeysResponse_deprecated.model_validate(
+        {str(k): v for k, v in keyset.items()}
+    )
+    return keys.root
 
 
 @router_deprecated.get(
@@ -99,8 +96,10 @@ async def keyset_deprecated(idBase64Urlsafe: str) -> Dict[str, str]:
     logger.trace(f"> GET /keys/{idBase64Urlsafe}")
     id = idBase64Urlsafe.replace("-", "+").replace("_", "/")
     keyset = ledger.get_keyset(keyset_id=id)
-    keys = KeysResponse_deprecated.parse_obj(keyset)
-    return keys.__root__
+    keys = KeysResponse_deprecated.model_validate(
+        {str(k): v for k, v in keyset.items()}
+    )
+    return keys.root
 
 
 @router_deprecated.get(
@@ -114,7 +113,8 @@ async def keyset_deprecated(idBase64Urlsafe: str) -> Dict[str, str]:
 async def keysets_deprecated() -> KeysetsResponse_deprecated:
     """This endpoint returns a list of keysets that the mint currently supports and will accept tokens from."""
     logger.trace("> GET /keysets")
-    keysets = KeysetsResponse_deprecated(keysets=list(ledger.keysets.keys()))
+    sat_keysets = {k: v for k, v in ledger.keysets.items() if v.unit == Unit.sat}
+    keysets = KeysetsResponse_deprecated(keysets=list(sat_keysets.keys()))
     return keysets
 
 
@@ -142,7 +142,7 @@ async def request_mint_deprecated(
     logger.trace(f"> GET /mint: amount={amount}")
     if amount > 21_000_000 * 100_000_000 or amount <= 0:
         raise CashuError(code=0, detail="Amount must be a valid amount of sat.")
-    if settings.mint_peg_out_only:
+    if settings.mint_bolt11_disable_mint:
         raise CashuError(code=0, detail="Mint does not allow minting new tokens.")
     quote = await ledger.mint_quote(PostMintQuoteRequest(amount=amount, unit="sat"))
     resp = GetMintResponse_deprecated(pr=quote.request, hash=quote.quote)
@@ -177,7 +177,7 @@ async def mint_deprecated(
     # BEGIN BACKWARDS COMPATIBILITY < 0.15
     # Mint expects "id" in outputs to know which keyset to use to sign them.
     outputs: list[BlindedMessage] = [
-        BlindedMessage(id=ledger.keyset.id, **o.dict(exclude={"id"}))
+        BlindedMessage(id=ledger.keyset.id, **o.model_dump(exclude={"id"}))
         for o in payload.outputs
     ]
     # END BACKWARDS COMPATIBILITY < 0.15
@@ -293,7 +293,7 @@ async def split_deprecated(
     assert payload.outputs, Exception("no outputs provided.")
     # BEGIN BACKWARDS COMPATIBILITY < 0.14: add "id" to outputs
     outputs: list[BlindedMessage] = [
-        BlindedMessage(id=ledger.keyset.id, **o.dict(exclude={"id"}))
+        BlindedMessage(id=ledger.keyset.id, **o.model_dump(exclude={"id"}))
         for o in payload.outputs
     ]
     # END BACKWARDS COMPATIBILITY < 0.14

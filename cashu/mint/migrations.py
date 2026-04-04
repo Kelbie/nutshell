@@ -1,7 +1,10 @@
 import copy
-from typing import Dict, List
+import json
+from typing import List
 
-from ..core.base import MintKeyset, Proof
+from sqlalchemy import RowMapping
+
+from ..core.base import MeltQuoteState, MintKeyset, MintQuoteState, Proof
 from ..core.crypto.keys import derive_keyset_id, derive_keyset_id_deprecated
 from ..core.db import Connection, Database
 from ..core.settings import settings
@@ -24,10 +27,10 @@ async def m001_initial(db: Database):
             f"""
                 CREATE TABLE IF NOT EXISTS {db.table_with_schema('promises')} (
                     amount {db.big_int} NOT NULL,
-                    b_b TEXT NOT NULL,
-                    c_b TEXT NOT NULL,
+                    b_ TEXT NOT NULL,
+                    c_ TEXT NOT NULL,
 
-                    UNIQUE (b_b)
+                    UNIQUE (b_)
 
                 );
             """
@@ -50,11 +53,11 @@ async def m001_initial(db: Database):
             f"""
                 CREATE TABLE IF NOT EXISTS {db.table_with_schema('invoices')} (
                     amount {db.big_int} NOT NULL,
-                    pr TEXT NOT NULL,
-                    hash TEXT NOT NULL,
+                    bolt11 TEXT NOT NULL,
+                    id TEXT NOT NULL,
                     issued BOOL NOT NULL,
 
-                    UNIQUE (hash)
+                    UNIQUE (id)
 
                 );
             """
@@ -73,40 +76,45 @@ async def create_balance_views(db: Database, conn: Connection):
     await conn.execute(
         f"""
         CREATE VIEW {db.table_with_schema('balance_issued')} AS
-        SELECT COALESCE(SUM(s), 0) AS balance FROM (
-            SELECT SUM(amount) AS s
+        SELECT id AS keyset, COALESCE(s, 0) AS balance FROM (
+            SELECT id, SUM(amount) AS s
             FROM {db.table_with_schema('promises')}
-            WHERE amount > 0
+            WHERE amount > 0 AND c_ IS NOT NULL
+            GROUP BY id
         ) AS balance_issued;
-    """
+        """
     )
-
     await conn.execute(
         f"""
         CREATE VIEW {db.table_with_schema('balance_redeemed')} AS
-        SELECT COALESCE(SUM(s), 0) AS balance FROM (
-            SELECT SUM(amount) AS s
+        SELECT id AS keyset, COALESCE(s, 0) AS balance FROM (
+            SELECT id, SUM(amount) AS s
             FROM {db.table_with_schema('proofs_used')}
             WHERE amount > 0
+            GROUP BY id
         ) AS balance_redeemed;
-    """
+        """
     )
-
     await conn.execute(
         f"""
         CREATE VIEW {db.table_with_schema('balance')} AS
-        SELECT s_issued - s_used FROM (
-            SELECT bi.balance AS s_issued, bu.balance AS s_used
+        SELECT keyset, s_issued - s_used AS balance FROM (
+            SELECT bi.keyset AS keyset,
+                bi.balance AS s_issued,
+                COALESCE(bu.balance, 0) AS s_used
             FROM {db.table_with_schema('balance_issued')} bi
-            CROSS JOIN {db.table_with_schema('balance_redeemed')} bu
+            LEFT OUTER JOIN {db.table_with_schema('balance_redeemed')} bu
+            ON bi.keyset = bu.keyset
         ) AS balance;
-    """
+        """
     )
 
 
 async def m002_add_balance_views(db: Database):
-    async with db.connect() as conn:
-        await create_balance_views(db, conn)
+    # NOTE: We move the creation of balance views after m007_proofs_and_promises_store_id
+    # async with db.connect() as conn:
+    # await create_balance_views(db, conn)
+    pass
 
 
 async def m003_mint_keysets(db: Database):
@@ -184,7 +192,7 @@ async def m006_invoices_add_payment_hash(db: Database):
             " TEXT"
         )
         await conn.execute(
-            f"UPDATE {db.table_with_schema('invoices')} SET payment_hash = hash"
+            f"UPDATE {db.table_with_schema('invoices')} SET payment_hash = id"
         )
 
 
@@ -203,6 +211,9 @@ async def m007_proofs_and_promises_store_id(db: Database):
             f"ALTER TABLE {db.table_with_schema('promises')} ADD COLUMN id TEXT"
         )
 
+        # create balance views
+        await create_balance_views(db, conn)
+
 
 async def m008_promises_dleq(db: Database):
     """
@@ -220,16 +231,6 @@ async def m008_promises_dleq(db: Database):
 async def m009_add_out_to_invoices(db: Database):
     # column in invoices for marking whether the invoice is incoming (out=False) or outgoing (out=True)
     async with db.connect() as conn:
-        # rename column pr to bolt11
-        await conn.execute(
-            f"ALTER TABLE {db.table_with_schema('invoices')} RENAME COLUMN pr TO"
-            " bolt11"
-        )
-        # rename column hash to payment_hash
-        await conn.execute(
-            f"ALTER TABLE {db.table_with_schema('invoices')} RENAME COLUMN hash TO id"
-        )
-
         await conn.execute(
             f"ALTER TABLE {db.table_with_schema('invoices')} ADD COLUMN out BOOL"
         )
@@ -710,7 +711,7 @@ async def m017_foreign_keys_proof_tables(db: Database):
         )
 
         await conn.execute(
-            f"INSERT INTO {db.table_with_schema('promises_new')} (amount, id, b_, c_, dleq_e, dleq_s, created) SELECT amount, id, b_b, c_b, e, s, created FROM {db.table_with_schema('promises')}"
+            f"INSERT INTO {db.table_with_schema('promises_new')} (amount, id, b_, c_, dleq_e, dleq_s, created) SELECT amount, id, b_, c_, e, s, created FROM {db.table_with_schema('promises')}"
         )
         await conn.execute(f"DROP TABLE {db.table_with_schema('promises')}")
         await conn.execute(
@@ -789,9 +790,9 @@ async def m020_add_state_to_mint_and_melt_quotes(db: Database):
     # and the `paid` and `issued` column respectively
     # mint quotes:
     async with db.connect() as conn:
-        rows: List[Dict] = await conn.fetchall(
+        rows: List[RowMapping] = await conn.fetchall(
             f"SELECT * FROM {db.table_with_schema('mint_quotes')}"
-        )
+        )  # type: ignore
         for row in rows:
             if row.get("issued"):
                 state = "issued"
@@ -805,9 +806,9 @@ async def m020_add_state_to_mint_and_melt_quotes(db: Database):
 
     # melt quotes:
     async with db.connect() as conn:
-        rows2: List[Dict] = await conn.fetchall(
+        rows2: List[RowMapping] = await conn.fetchall(
             f"SELECT * FROM {db.table_with_schema('melt_quotes')}"
-        )
+        )  # type: ignore
         for row in rows2:
             if row["paid"]:
                 state = "paid"
@@ -826,3 +827,401 @@ async def m021_add_change_and_expiry_to_melt_quotes(db: Database):
         await conn.execute(
             f"ALTER TABLE {db.table_with_schema('melt_quotes')} ADD COLUMN expiry TIMESTAMP"
         )
+
+
+async def m022_quote_set_states_to_values(db: Database):
+    async with db.connect() as conn:
+        for melt_quote_states in MeltQuoteState:
+            await conn.execute(
+                f"UPDATE {db.table_with_schema('melt_quotes')} SET state = '{melt_quote_states.value}' WHERE state = '{melt_quote_states.name}'"
+            )
+        for mint_quote_states in MintQuoteState:
+            await conn.execute(
+                f"UPDATE {db.table_with_schema('mint_quotes')} SET state = '{mint_quote_states.value}' WHERE state = '{mint_quote_states.name}'"
+            )
+
+
+async def m023_add_key_to_mint_quote_table(db: Database):
+    async with db.connect() as conn:
+        await conn.execute(
+            f"""
+                ALTER TABLE {db.table_with_schema('mint_quotes')}
+                ADD COLUMN pubkey TEXT DEFAULT NULL
+            """
+        )
+
+
+async def m024_add_melt_quote_outputs(db: Database):
+    async with db.connect() as conn:
+        await conn.execute(
+            f"""
+                ALTER TABLE {db.table_with_schema('melt_quotes')}
+                ADD COLUMN outputs TEXT DEFAULT NULL
+            """
+        )
+
+
+async def m025_add_amounts_to_keysets(db: Database):
+    async with db.connect() as conn:
+        await conn.execute(
+            f"ALTER TABLE {db.table_with_schema('keysets')} ADD COLUMN amounts TEXT"
+        )
+        await conn.execute(
+            f"UPDATE {db.table_with_schema('keysets')} SET amounts = '[]'"
+        )
+
+
+async def m026_keyset_specific_balance_views(db: Database):
+    async def add_missing_id_to_proofs_and_promises(db: Database, conn: Connection):
+        """
+        Balance views now show the balance for each keyset. Some old proofs may not have
+        an id set.
+
+        We fix some of the old proofs and promises that did not have an id
+        set by selecting the oldest (hex) keyset we can find and fill in the id.
+        """
+        # get keyset with smallest first_seen that starts with "00"
+        keyset = await conn.fetchone(
+            f"SELECT * FROM {db.table_with_schema('keysets')} WHERE id LIKE '00%' ORDER BY first_seen LIMIT 1"
+        )
+        # get all promises where id is NULL
+        promises = await conn.fetchall(
+            f"SELECT * FROM {db.table_with_schema('promises')} WHERE id IS NULL"
+        )
+        proofs_used = await conn.fetchall(
+            f"SELECT * FROM {db.table_with_schema('proofs_used')} WHERE id IS NULL"
+        )
+        proofs_pending = await conn.fetchall(
+            f"SELECT * FROM {db.table_with_schema('proofs_pending')} WHERE id IS NULL"
+        )
+        if not keyset and (promises or proofs_used or proofs_pending):
+            raise Exception(
+                "Migration failed: No keyset found, but there are promises or proofs without id. Please report this issue."
+            )
+        if not keyset or not (promises or proofs_used or proofs_pending):
+            # no migration needed
+            return
+
+        keyset_id = keyset["id"]
+        if promises:
+            await conn.execute(
+                f"UPDATE {db.table_with_schema('promises')} SET id = '{keyset_id}' WHERE id IS NULL"
+            )
+        if proofs_used:
+            await conn.execute(
+                f"UPDATE {db.table_with_schema('proofs_used')} SET id = '{keyset_id}' WHERE id IS NULL"
+            )
+        if proofs_pending:
+            await conn.execute(
+                f"UPDATE {db.table_with_schema('proofs_pending')} SET id = '{keyset_id}' WHERE id IS NULL"
+            )
+
+    async with db.connect() as conn:
+        await add_missing_id_to_proofs_and_promises(db, conn)
+        await drop_balance_views(db, conn)
+        await create_balance_views(db, conn)
+
+
+async def m027_add_balance_to_keysets_and_log_table(db: Database):
+    async with db.connect() as conn:
+        await conn.execute(
+            f"""
+                ALTER TABLE {db.table_with_schema('keysets')}
+                ADD COLUMN balance INTEGER NOT NULL DEFAULT 0
+            """
+        )
+        await conn.execute(
+            f"""
+                ALTER TABLE {db.table_with_schema('keysets')}
+                ADD COLUMN fees_paid INTEGER NOT NULL DEFAULT 0
+            """
+        )
+        # copy the balances from the balance view for each keyset
+        await conn.execute(
+            f"""
+                UPDATE {db.table_with_schema('keysets')}
+                SET balance = COALESCE(
+                    (
+                        SELECT b.balance
+                        FROM {db.table_with_schema('balance')} AS b
+                        WHERE b.keyset = keysets.id
+                    ),
+                    0
+                )
+            """
+        )
+        await conn.execute(
+            f"""
+                CREATE TABLE IF NOT EXISTS {db.table_with_schema('balance_log')} (
+                    unit TEXT NOT NULL,
+                    keyset_balance INTEGER NOT NULL,
+                    keyset_fees_paid INTEGER NOT NULL,
+                    backend_balance INTEGER NOT NULL,
+                    time TIMESTAMP DEFAULT {db.timestamp_now}
+                );
+            """
+        )
+
+
+async def m028_promises_c_allow_null_add_melt_quote(db: Database):
+    """
+    Allow column that stores the c_ to be NULL and add melt_quote to promises.
+    Insert all change promises from melt_quotes into the promises table.
+    Drop the change and the outputs columns from melt_quotes.
+    """
+
+    # migrate stored melt outputs for pending quotes into promises
+    async def migrate_stored_melt_outputs_for_pending_quotes(
+        db: Database, conn: Connection
+    ):
+        rows = await conn.fetchall(
+            f"""
+                SELECT quote, outputs FROM {db.table_with_schema('melt_quotes')}
+                WHERE state = :state AND outputs IS NOT NULL
+            """,
+            {"state": MeltQuoteState.pending.value},
+        )
+        for row in rows:
+            try:
+                outputs = json.loads(row["outputs"]) if row["outputs"] else []
+            except Exception:
+                outputs = []
+
+            for o in outputs:
+                amount = o.get("amount") if isinstance(o, dict) else None
+                keyset_id = o.get("id") if isinstance(o, dict) else None
+                b_hex = o.get("B_") if isinstance(o, dict) else None
+                if amount is None or keyset_id is None or b_hex is None:
+                    continue
+                # check if promise with b_ already exists
+                existing_promise = await conn.fetchone(
+                    f"""
+                        SELECT * FROM {db.table_with_schema('promises')}
+                        WHERE b_ = :b_
+                    """,
+                    {
+                        "b_": b_hex,
+                    },
+                )
+                if not existing_promise:
+                    await conn.execute(
+                        f"""
+                            INSERT INTO {db.table_with_schema('promises')}
+                            (amount, id, b_, created, mint_quote, melt_quote, swap_id)
+                            VALUES (:amount, :id, :b_, :created, :mint_quote, :melt_quote, :swap_id)
+                        """,
+                        {
+                            "amount": int(amount),
+                            "id": keyset_id,
+                            "b_": b_hex,
+                            "created": db.to_timestamp(db.timestamp_now_str()),
+                            "mint_quote": None,
+                            "melt_quote": row["quote"],
+                            "swap_id": None,
+                        },
+                    )
+
+    # remove obsolete columns outputs and change from melt_quotes
+    async def remove_obsolete_columns_from_melt_quotes(db: Database, conn: Connection):
+        if conn.type == "SQLITE":
+            # For SQLite, recreate table without the columns
+            await conn.execute("PRAGMA foreign_keys=OFF;")
+            await conn.execute(
+                f"""
+                    CREATE TABLE IF NOT EXISTS {db.table_with_schema('melt_quotes_new')} (
+                        quote TEXT NOT NULL,
+                        method TEXT NOT NULL,
+                        request TEXT NOT NULL,
+                        checking_id TEXT NOT NULL,
+                        unit TEXT NOT NULL,
+                        amount {db.big_int} NOT NULL,
+                        fee_reserve {db.big_int},
+                        paid BOOL NOT NULL,
+                        created_time TIMESTAMP,
+                        paid_time TIMESTAMP,
+                        fee_paid {db.big_int},
+                        proof TEXT,
+                        state TEXT,
+                        expiry TIMESTAMP,
+
+                        UNIQUE (quote)
+                    );
+                """
+            )
+            await conn.execute(
+                f"""
+                    INSERT INTO {db.table_with_schema('melt_quotes_new')} (
+                        quote, method, request, checking_id, unit, amount, fee_reserve, paid, created_time, paid_time, fee_paid, proof, state, expiry
+                    )
+                    SELECT quote, method, request, checking_id, unit, amount, fee_reserve, paid, created_time, paid_time, fee_paid, proof, state, expiry
+                    FROM {db.table_with_schema('melt_quotes')};
+                """
+            )
+            await conn.execute(f"DROP TABLE {db.table_with_schema('melt_quotes')}")
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('melt_quotes_new')} RENAME TO {db.table_with_schema('melt_quotes')}"
+            )
+            await conn.execute("PRAGMA foreign_keys=ON;")
+        else:
+            # For Postgres/Cockroach, drop the columns directly if they exist
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('melt_quotes')} DROP COLUMN IF EXISTS outputs"
+            )
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('melt_quotes')} DROP COLUMN IF EXISTS change"
+            )
+
+    # recreate promises table with columns mint_quote, melt_quote, swap_id and with c_ nullable
+    async def recreate_promises_table(db: Database, conn: Connection):
+        if conn.type == "SQLITE":
+            await conn.execute("PRAGMA foreign_keys=OFF;")
+            await conn.execute(
+                f"""
+                        CREATE TABLE IF NOT EXISTS {db.table_with_schema('promises_new')} (
+                            amount {db.big_int} NOT NULL,
+                            id TEXT,
+                            b_ TEXT NOT NULL,
+                            c_ TEXT,
+                            dleq_e TEXT,
+                            dleq_s TEXT,
+                            created TIMESTAMP,
+                            signed_at TIMESTAMP,
+                            mint_quote TEXT,
+                            melt_quote TEXT,
+                            swap_id TEXT,
+
+                            FOREIGN KEY (mint_quote) REFERENCES {db.table_with_schema('mint_quotes')}(quote),
+                            FOREIGN KEY (melt_quote) REFERENCES {db.table_with_schema('melt_quotes')}(quote),
+
+                            UNIQUE (b_)
+                        );
+                    """
+            )
+
+            await conn.execute(
+                f"INSERT INTO {db.table_with_schema('promises_new')} (amount, id, b_, c_, dleq_e, dleq_s, created, mint_quote, swap_id) "
+                f"SELECT amount, id, b_, c_, dleq_e, dleq_s, created, mint_quote, swap_id FROM {db.table_with_schema('promises')}"
+            )
+
+            await conn.execute(f"DROP TABLE {db.table_with_schema('promises')}")
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('promises_new')} RENAME TO {db.table_with_schema('promises')}"
+            )
+            await conn.execute("PRAGMA foreign_keys=ON;")
+        else:
+            # add columns melt_quote, signed_at and make column c_ nullable
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('promises')} ADD COLUMN melt_quote TEXT"
+            )
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('promises')} ADD COLUMN signed_at TIMESTAMP"
+            )
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('promises')} ALTER COLUMN c_ DROP NOT NULL"
+            )
+            # add foreign key constraint to melt_quote
+            await conn.execute(
+                f"ALTER TABLE {db.table_with_schema('promises')} ADD CONSTRAINT fk_promises_melt_quote FOREIGN KEY (melt_quote) REFERENCES {db.table_with_schema('melt_quotes')}(quote)"
+            )
+
+    async with db.connect() as conn:
+        # drop the balance views first
+        await drop_balance_views(db, conn)
+
+        # recreate promises table
+        await recreate_promises_table(db, conn)
+
+        # migrate stored melt outputs for pending quotes into promises
+        await migrate_stored_melt_outputs_for_pending_quotes(db, conn)
+
+        # remove obsolete columns from melt_quotes table
+        await remove_obsolete_columns_from_melt_quotes(db, conn)
+
+        # recreate the balance views
+        await create_balance_views(db, conn)
+
+async def m029_remove_overlong_witness_values(db: Database):
+    """
+    Delete any witness values longer than 1024 characters in proofs tables.
+    """
+    async with db.connect() as conn:
+        # Clean proofs_used
+        await conn.execute(
+            f"UPDATE {db.table_with_schema('proofs_used')} SET witness = NULL "
+            "WHERE witness IS NOT NULL AND LENGTH(witness) > 1024"
+        )
+
+        # Clean proofs_pending (column exists in newer schemas)
+        await conn.execute(
+            f"UPDATE {db.table_with_schema('proofs_pending')} SET witness = NULL "
+            "WHERE witness IS NOT NULL AND LENGTH(witness) > 1024"
+        )
+
+
+async def m030_remove_overlong_witness_values(db: Database):
+    """
+    Repeat m029 after limiting all new witness values to 1024 characters.
+    """
+    await m029_remove_overlong_witness_values(db)
+
+
+async def m031_add_final_expiry_to_keysets(db: Database):
+    """
+    Add final_expiry column to keysets table for keysets v2 support.
+    """
+    async with db.connect() as conn:
+        await conn.execute(
+            f"""
+                ALTER TABLE {db.table_with_schema('keysets')}
+                ADD COLUMN final_expiry INTEGER NULL
+            """
+        )
+
+async def m032_remove_paid_and_issued_from_mint_quote(db: Database):
+    """
+    Remove the deprecated 'paid' and 'issued' fields from mint_quotes.
+    The 'state' column now fully represents payment status.
+    """
+    async with db.connect() as conn:
+        if conn.type == "SQLITE":
+            await conn.execute("PRAGMA foreign_keys=OFF;")
+
+            # Recreate mint_quotes without 'paid' and 'issued'
+            await conn.execute(
+                f"""
+                CREATE TABLE {db.table_with_schema('mint_quotes_new')} (
+                    quote TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    request TEXT NOT NULL,
+                    checking_id TEXT NOT NULL,
+                    unit TEXT NOT NULL,
+                    amount {db.big_int} NOT NULL,
+                    created_time TIMESTAMP,
+                    paid_time TIMESTAMP,
+                    state TEXT,
+                    pubkey TEXT,
+
+                    UNIQUE (quote)
+                );
+            """
+            )
+
+            # Copy data (exclude 'paid' and 'issued')
+            await conn.execute(
+                f"""
+                INSERT INTO {db.table_with_schema('mint_quotes_new')} (quote, method, request, checking_id, unit, amount, created_time, paid_time, state, pubkey)
+                SELECT quote, method, request, checking_id, unit, amount, created_time, paid_time, state, pubkey
+                FROM {db.table_with_schema('mint_quotes')};
+            """
+            )
+
+            # Swap tables
+            await conn.execute(f"DROP TABLE {db.table_with_schema('mint_quotes')};")
+            await conn.execute(f"ALTER TABLE {db.table_with_schema('mint_quotes_new')} RENAME TO {db.table_with_schema('mint_quotes')};")
+
+            await conn.execute("PRAGMA foreign_keys=ON;")
+
+        elif conn.type == "POSTGRES":
+            # Postgres supports dropping columns directly
+            await conn.execute("ALTER TABLE mint_quotes DROP COLUMN IF EXISTS paid;")
+            await conn.execute("ALTER TABLE mint_quotes DROP COLUMN IF EXISTS issued;")

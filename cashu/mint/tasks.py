@@ -1,22 +1,16 @@
 import asyncio
-from typing import List, Mapping
+import time
+from typing import List
 
 from loguru import logger
 
-from ..core.base import Method, MintQuoteState, Unit
-from ..core.db import Database
+from ..core.base import MintQuoteState
+from ..core.settings import settings
 from ..lightning.base import LightningBackend
-from ..mint.crud import LedgerCrud
-from .events.events import LedgerEventManager
 from .protocols import SupportsBackends, SupportsDb, SupportsEvents
 
 
 class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
-    backends: Mapping[Method, Mapping[Unit, LightningBackend]] = {}
-    db: Database
-    crud: LedgerCrud
-    events: LedgerEventManager
-
     async def dispatch_listeners(self) -> List[asyncio.Task]:
         tasks = []
         for method, unitbackends in self.backends.items():
@@ -29,20 +23,29 @@ class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
 
     async def invoice_listener(self, backend: LightningBackend) -> None:
         if backend.supports_incoming_payment_stream:
+            retry_delay = settings.mint_retry_exponential_backoff_base_delay
+            max_retry_delay = settings.mint_retry_exponential_backoff_max_delay
+            
             while True:
                 try:
+                    # Reset retry delay on successful connection to backend stream
+                    retry_delay = settings.mint_retry_exponential_backoff_base_delay
                     async for checking_id in backend.paid_invoices_stream():
                         await self.invoice_callback_dispatcher(checking_id)
                 except Exception as e:
                     logger.error(f"Error in invoice listener: {e}")
-                    logger.info("Restarting invoice listener...")
-                    await asyncio.sleep(1)
+                    logger.info(f"Restarting invoice listener in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    
+                    # Exponential backoff
+                    retry_delay = min(retry_delay * 2, max_retry_delay)
 
     async def invoice_callback_dispatcher(self, checking_id: str) -> None:
         logger.debug(f"Invoice callback dispatcher: {checking_id}")
         async with self.db.get_connection(
             lock_table="mint_quotes",
-            lock_select_statement=f"checking_id='{checking_id}'",
+            lock_select_statement="checking_id = :checking_id",
+            lock_parameters={"checking_id": checking_id},
             lock_timeout=5,
         ) as conn:
             quote = await self.crud.get_mint_quote(
@@ -58,6 +61,7 @@ class LedgerTasks(SupportsDb, SupportsBackends, SupportsEvents):
             # set the quote as paid
             if quote.unpaid:
                 quote.state = MintQuoteState.paid
+                quote.paid_time = int(time.time())
                 await self.crud.update_mint_quote(quote=quote, db=self.db, conn=conn)
                 logger.trace(
                     f"Quote {quote.quote} with {MintQuoteState.unpaid} set as {quote.state.value}"

@@ -41,13 +41,16 @@ INVOICE_RESULT_MAP = {
     "ACCEPTED": PaymentResult.PENDING,
 }
 
+MAX_ROUTE_RETRIES = 50
+TEMPORARY_CHANNEL_FAILURE_ERROR = "TEMPORARY_CHANNEL_FAILURE"
+
 
 class LndRestWallet(LightningBackend):
     """https://api.lightning.community/rest/index.html#lnd-rest-api-reference"""
 
     supports_mpp = settings.mint_lnd_enable_mpp
-    supported_units = set([Unit.sat, Unit.msat, Unit.usd, Unit.eur, Unit.gbp])
     supports_incoming_payment_stream = True
+    supported_units = {Unit.sat, Unit.msat}
     supports_description: bool = True
     unit = Unit.sat
 
@@ -97,7 +100,7 @@ class LndRestWallet(LightningBackend):
 
         self.auth = {"Grpc-Metadata-macaroon": self.macaroon}
         self.client = httpx.AsyncClient(
-            base_url=self.endpoint, headers=self.auth, verify=self.cert
+            base_url=self.endpoint, headers=self.auth, verify=self.cert, timeout=None,
         )
         if self.supports_mpp:
             logger.info("LNDRestWallet enabling MPP feature")
@@ -109,7 +112,7 @@ class LndRestWallet(LightningBackend):
         except (httpx.ConnectError, httpx.RequestError) as exc:
             return StatusResponse(
                 error_message=f"Unable to connect to {self.endpoint}. {exc}",
-                balance=0,
+                balance=Amount(self.unit, 0),
             )
 
         try:
@@ -117,9 +120,13 @@ class LndRestWallet(LightningBackend):
             if r.is_error:
                 raise Exception
         except Exception:
-            return StatusResponse(error_message=r.text[:200], balance=0)
+            return StatusResponse(
+                error_message=r.text[:200], balance=Amount(self.unit, 0)
+            )
 
-        return StatusResponse(error_message=None, balance=int(data["balance"]) * 1000)
+        return StatusResponse(
+            error_message=None, balance=Amount(self.unit, int(data["balance"]))
+        )
 
     async def create_invoice(
         self,
@@ -219,6 +226,8 @@ class LndRestWallet(LightningBackend):
     async def pay_partial_invoice(
         self, quote: MeltQuote, amount: Amount, fee_limit_msat: int
     ) -> PaymentResponse:
+        attempts = 0
+
         # set the fee limit for the payment
         lnrpcFeeLimit = dict()
         lnrpcFeeLimit["fixed_msat"] = f"{fee_limit_msat}"
@@ -236,47 +245,78 @@ class LndRestWallet(LightningBackend):
         assert payer_addr_tag
         payer_addr = str(payer_addr_tag.data)
 
-        # get the route
-        r = await self.client.post(
-            url=f"/v1/graph/routes/{pubkey}/{amount.to(Unit.sat).amount}",
-            json={"fee_limit": lnrpcFeeLimit},
-            timeout=None,
-        )
+        # add the mpp_record to the last hop
+        response: Optional[httpx.Response] = None
+        route: Optional[httpx.Response] = None
 
-        data = r.json()
-        if r.is_error or data.get("message"):
-            error_message = data.get("message") or r.text
-            return PaymentResponse(
-                result=PaymentResult.FAILED, error_message=error_message
+        for attempt in range(MAX_ROUTE_RETRIES):
+            attempts += 1
+            # get the route
+            route = await self.client.post(
+                url=f"/v1/graph/routes/{pubkey}/{amount.to(Unit.sat).amount}",
+                json={
+                    "fee_limit": lnrpcFeeLimit,
+                    "use_mission_control": True,
+                },
+                timeout=None,
             )
 
-        # We need to set the mpp_record for a partial payment
-        mpp_record = {
-            "mpp_record": {
-                "payment_addr": base64.b64encode(bytes.fromhex(payer_addr)).decode(),
-                "total_amt_msat": total_amount_msat,
+            assert route
+
+            route_data = route.json()
+            if route.is_error or route_data.get("message"):
+                error_message = route_data.get("message") or route.text
+                return PaymentResponse(
+                    result=PaymentResult.FAILED, error_message=error_message
+                )
+
+            # We need to set the mpp_record for a partial payment
+            mpp_record = {
+                "mpp_record": {
+                    "payment_addr": base64.b64encode(
+                        bytes.fromhex(payer_addr)
+                    ).decode(),
+                    "total_amt_msat": total_amount_msat,
+                }
             }
-        }
+            route_data["routes"][0]["hops"][-1].update(mpp_record)
 
-        # add the mpp_record to the last hop
-        rout_nr = 0
-        data["routes"][rout_nr]["hops"][-1].update(mpp_record)
+            # send to route
+            response = await self.client.post(
+                url="/v2/router/route/send",
+                json={
+                    "payment_hash": base64.b64encode(
+                        bytes.fromhex(invoice.payment_hash)
+                    ).decode(),
+                    "route": route_data["routes"][0],
+                },
+                timeout=None,
+            )
 
-        # send to route
-        r = await self.client.post(
-            url="/v2/router/route/send",
-            json={
-                "payment_hash": base64.b64encode(
-                    bytes.fromhex(invoice.payment_hash)
-                ).decode(),
-                "route": data["routes"][rout_nr],
-            },
-            timeout=None,
-        )
+            assert response
 
-        data = r.json()
-        if r.is_error or data.get("message"):
-            error_message = data.get("message") or r.text
+            response_data = response.json()
+            if response_data.get("status") == "FAILED":
+                if response_data["failure"]["code"] == TEMPORARY_CHANNEL_FAILURE_ERROR:
+                    # Add the channels that failed to the excluded channels
+                    failure_index = response_data["failure"]["failure_source_index"]
+                    failed_source = route_data["routes"][0]["hops"][failure_index - 1][
+                        "pub_key"
+                    ]
+                    failed_dest = route_data["routes"][0]["hops"][failure_index][
+                        "pub_key"
+                    ]
+                    logger.debug(
+                        f"Partial payment failed from {failed_source} to {failed_dest} at index {failure_index-1} of the route"
+                    )
+                    continue
+            break
+
+        assert response and route
+
+        data = response.json()
+        if response.is_error or data.get("message") or data.get("status") == "FAILED":
+            error_message = f"Sending to route failed with code {data.get('failure').get('code')} after {attempts} tries."
             return PaymentResponse(
                 result=PaymentResult.FAILED, error_message=error_message
             )
@@ -286,6 +326,11 @@ class LndRestWallet(LightningBackend):
         fee_msat = int(data["route"]["total_fees_msat"]) if data.get("route") else None
         preimage = (
             base64.b64decode(data["preimage"]).hex() if data.get("preimage") else None
+        )
+
+        logger.debug(f"Partial payment succeeded after {attempts} different tries!")
+        logger.debug(
+            f"Partial payment route length was {len(route.json().get('routes'))} hops."
         )
         return PaymentResponse(
             result=result,
@@ -370,10 +415,15 @@ class LndRestWallet(LightningBackend):
         return PaymentStatus(result=PaymentResult.UNKNOWN, error_message="timeout")
 
     async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
+        retry_delay = 0
+        max_retry_delay = settings.mint_retry_exponential_backoff_max_delay
+        
         while True:
             try:
                 url = "/v1/invoices/subscribe"
                 async with self.client.stream("GET", url, timeout=None) as r:
+                    # Reset retry delay on successful connection
+                    retry_delay = 0
                     async for line in r.aiter_lines():
                         try:
                             inv = json.loads(line)["result"]
@@ -386,27 +436,23 @@ class LndRestWallet(LightningBackend):
                         yield payment_hash
             except Exception as exc:
                 logger.error(
-                    f"lost connection to lnd invoices stream: '{exc}', retrying in 5"
+                    f"lost connection to lnd invoices stream: '{exc}', retrying in {retry_delay}"
                     " seconds"
                 )
-                await asyncio.sleep(5)
+                await asyncio.sleep(retry_delay)
+                
+                # Exponential backoff with jitter
+                retry_delay = max(settings.mint_retry_exponential_backoff_base_delay, min(retry_delay * 2, max_retry_delay))
 
     async def get_payment_quote(
         self, melt_quote: PostMeltQuoteRequest
     ) -> PaymentQuoteResponse:
-        # get amount from melt_quote or from bolt11
-        amount = (
-            Amount(Unit[melt_quote.unit], melt_quote.mpp_amount)
-            if melt_quote.is_mpp
-            else None
-        )
+        amount_msat = melt_quote.mpp_amount if melt_quote.is_mpp else None
 
         invoice_obj = decode(melt_quote.request)
         assert invoice_obj.amount_msat, "invoice has no amount."
 
-        if amount:
-            amount_msat = amount.to(Unit.msat).amount
-        else:
+        if amount_msat is None:
             amount_msat = int(invoice_obj.amount_msat)
 
         fees_msat = fee_reserve(amount_msat)

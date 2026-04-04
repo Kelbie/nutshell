@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 
 from .crypto.secp import PrivateKey
 
@@ -13,35 +13,43 @@ class SecretKind(Enum):
     HTLC = "HTLC"
 
 
-class Tags(BaseModel):
+class Tags(RootModel):
     """
     Tags are used to encode additional information in the Secret of a Proof.
     """
 
-    __root__: List[List[str]] = []
+    root: List[List[str]] = []
 
     def __init__(self, tags: Optional[List[List[str]]] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.__root__ = tags or []
+        super().__init__(root=tags or [], **kwargs)
 
     def __setitem__(self, key: str, value: Union[str, List[str]]) -> None:
         if isinstance(value, str):
-            self.__root__.append([key, value])
+            self.root.append([key, value])
         elif isinstance(value, list):
-            self.__root__.append([key, *value])
+            self.root.append([key, *value])
 
     def __getitem__(self, key: str) -> Union[str, None]:
         return self.get_tag(key)
 
     def get_tag(self, tag_name: str) -> Union[str, None]:
-        for tag in self.__root__:
+        for tag in self.root:
             if tag[0] == tag_name:
                 return tag[1]
         return None
 
+    def get_tag_int(self, tag_name: str) -> Union[int, None]:
+        tag = self.get_tag(tag_name)
+        if tag is not None:
+            try:
+                return int(tag)
+            except ValueError:
+                logger.warning(f"Tag {tag_name} is not an integer")
+        return None
+
     def get_tag_all(self, tag_name: str) -> List[str]:
         all_tags = []
-        for tag in self.__root__:
+        for tag in self.root:
             if tag[0] == tag_name:
                 for t in tag[1:]:
                     all_tags.append(t)
@@ -59,11 +67,11 @@ class Secret(BaseModel):
     def serialize(self) -> str:
         data_dict: Dict[str, Any] = {
             "data": self.data,
-            "nonce": self.nonce or PrivateKey().serialize()[:32],
+            "nonce": self.nonce or PrivateKey().to_hex()[:32],
         }
-        if self.tags.__root__:
-            logger.debug(f"Serializing tags: {self.tags.__root__}")
-            data_dict["tags"] = self.tags.__root__
+        if self.tags.root:
+            logger.debug(f"Serializing tags: {self.tags.root}")
+            data_dict["tags"] = self.tags.root
         return json.dumps(
             [self.kind, data_dict],
         )
@@ -77,3 +85,19 @@ class Secret(BaseModel):
         tags = Tags(tags=tags_list)
         logger.debug(f"Deserialized Secret: {kind}, {data}, {nonce}, {tags}")
         return cls(kind=kind, data=data, nonce=nonce, tags=tags)
+
+    def __eq__(self, value: object) -> bool:
+        # two secrets are equal if they have the same kind, data and tags (ignoring nonce)
+        if not isinstance(value, Secret):
+            return False
+        return (
+            self.kind == value.kind
+            and self.data == value.data
+            and self.tags.root == value.tags.root
+        )
+
+    def __hash__(self) -> int:
+        # everything except nonce
+        return hash(
+            (self.kind, self.data, tuple(s for xs in self.tags.root for s in xs))
+        )

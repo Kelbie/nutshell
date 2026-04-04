@@ -2,8 +2,23 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..core.base import Invoice, Proof, WalletKeyset
+from ..core.base import (
+    MeltQuote,
+    MeltQuoteState,
+    MintQuote,
+    MintQuoteState,
+    Proof,
+    WalletKeyset,
+    WalletMint,
+)
 from ..core.db import Connection, Database
+
+
+class _UnsetType:
+    pass
+
+
+_UNSET = _UnsetType()
 
 
 async def store_proof(
@@ -24,7 +39,7 @@ async def store_proof(
             "secret": str(proof.secret),
             "time_created": int(time.time()),
             "derivation_path": proof.derivation_path,
-            "dleq": json.dumps(proof.dleq.dict()) if proof.dleq else "",
+            "dleq": json.dumps(proof.dleq.model_dump()) if proof.dleq else "",
             "mint_id": proof.mint_id,
             "melt_id": proof.melt_id,
         },
@@ -113,31 +128,31 @@ async def invalidate_proof(
 async def update_proof(
     proof: Proof,
     *,
-    reserved: Optional[bool] = None,
-    send_id: Optional[str] = None,
-    mint_id: Optional[str] = None,
-    melt_id: Optional[str] = None,
+    reserved: bool | _UnsetType = _UNSET,
+    send_id: str | None | _UnsetType = _UNSET,
+    mint_id: str | None | _UnsetType = _UNSET,
+    melt_id: str | None | _UnsetType = _UNSET,
     db: Optional[Database] = None,
     conn: Optional[Connection] = None,
 ) -> None:
     clauses = []
     values: Dict[str, Any] = {}
 
-    if reserved is not None:
+    if reserved is not _UNSET:
         clauses.append("reserved = :reserved")
         values["reserved"] = reserved
         clauses.append("time_reserved = :time_reserved")
         values["time_reserved"] = int(time.time())
 
-    if send_id is not None:
+    if send_id is not _UNSET:
         clauses.append("send_id = :send_id")
         values["send_id"] = send_id
 
-    if mint_id is not None:
+    if mint_id is not _UNSET:
         clauses.append("mint_id = :mint_id")
         values["mint_id"] = mint_id
 
-    if melt_id is not None:
+    if melt_id is not _UNSET:
         clauses.append("melt_id = :melt_id")
         values["melt_id"] = melt_id
 
@@ -217,7 +232,7 @@ async def get_keysets(
         """,
         values,
     )
-    return [WalletKeyset.from_row(r) for r in rows]
+    return [WalletKeyset.from_row(r) for r in rows]  # type: ignore
 
 
 async def update_keyset(
@@ -228,93 +243,90 @@ async def update_keyset(
     await (conn or db).execute(
         """
         UPDATE keysets
-        SET active = :active
+        SET active = :active, input_fee_ppk = :input_fee_ppk
         WHERE id = :id
         """,
         {
             "active": keyset.active,
             "id": keyset.id,
+            "input_fee_ppk": keyset.input_fee_ppk,
         },
     )
 
 
-async def store_lightning_invoice(
+async def store_bolt11_mint_quote(
     db: Database,
-    invoice: Invoice,
+    quote: MintQuote,
     conn: Optional[Connection] = None,
 ) -> None:
     await (conn or db).execute(
         """
-        INSERT INTO invoices
-          (amount, bolt11, id, payment_hash, preimage, paid, time_created, time_paid, out)
-        VALUES (:amount, :bolt11, :id, :payment_hash, :preimage, :paid, :time_created, :time_paid, :out)
+        INSERT INTO bolt11_mint_quotes
+            (quote, mint, method, request, checking_id, unit, amount, state, created_time, paid_time, expiry, privkey)
+        VALUES (:quote, :mint, :method, :request, :checking_id, :unit, :amount, :state, :created_time, :paid_time, :expiry, :privkey)
         """,
         {
-            "amount": invoice.amount,
-            "bolt11": invoice.bolt11,
-            "id": invoice.id,
-            "payment_hash": invoice.payment_hash,
-            "preimage": invoice.preimage,
-            "paid": invoice.paid,
-            "time_created": invoice.time_created,
-            "time_paid": invoice.time_paid,
-            "out": invoice.out,
+            "quote": quote.quote,
+            "mint": quote.mint,
+            "method": quote.method,
+            "request": quote.request,
+            "checking_id": quote.checking_id,
+            "unit": quote.unit,
+            "amount": quote.amount,
+            "state": quote.state.value,
+            "created_time": quote.created_time,
+            "paid_time": quote.paid_time,
+            "expiry": quote.expiry,
+            "privkey": quote.privkey or "",
         },
     )
 
 
-async def get_lightning_invoice(
-    *,
+async def get_bolt11_mint_quote(
     db: Database,
-    id: str = "",
-    payment_hash: str = "",
-    out: Optional[bool] = None,
+    quote: str | None = None,
+    request: str | None = None,
     conn: Optional[Connection] = None,
-) -> Optional[Invoice]:
+) -> Optional[MintQuote]:
+    if not quote and not request:
+        raise ValueError("quote or request must be provided")
     clauses = []
     values: Dict[str, Any] = {}
-    if id:
-        clauses.append("id = :id")
-        values["id"] = id
-    if payment_hash:
-        clauses.append("payment_hash = :payment_hash")
-        values["payment_hash"] = payment_hash
-    if out is not None:
-        clauses.append("out = :out")
-        values["out"] = out
+    if quote:
+        clauses.append("quote = :quote")
+        values["quote"] = quote
+    if request:
+        clauses.append("request = :request")
+        values["request"] = request
 
     where = ""
     if clauses:
         where = f"WHERE {' AND '.join(clauses)}"
-    query = f"""
-        SELECT * from invoices
-        {where}
-        """
+
     row = await (conn or db).fetchone(
-        query,
+        f"""
+        SELECT * from bolt11_mint_quotes
+        {where}
+        """,
         values,
     )
-    return Invoice(**row) if row else None
+    return MintQuote.from_row(row) if row else None  # type: ignore
 
 
-async def get_lightning_invoices(
+async def get_bolt11_mint_quotes(
     db: Database,
-    paid: Optional[bool] = None,
-    pending: Optional[bool] = None,
+    mint: Optional[str] = None,
+    state: Optional[MintQuoteState] = None,
     conn: Optional[Connection] = None,
-) -> List[Invoice]:
+) -> List[MintQuote]:
     clauses = []
     values: Dict[str, Any] = {}
-
-    if paid is not None and not pending:
-        clauses.append("paid = :paid")
-        values["paid"] = paid
-
-    if pending:
-        clauses.append("paid = :paid")
-        values["paid"] = False
-        clauses.append("out = :out")
-        values["out"] = False
+    if mint:
+        clauses.append("mint = :mint")
+        values["mint"] = mint
+    if state:
+        clauses.append("state = :state")
+        values["state"] = state.value
 
     where = ""
     if clauses:
@@ -322,37 +334,149 @@ async def get_lightning_invoices(
 
     rows = await (conn or db).fetchall(
         f"""
-        SELECT * from invoices
+        SELECT * from bolt11_mint_quotes
         {where}
         """,
         values,
     )
-    return [Invoice(**r) for r in rows]
+    return [MintQuote.from_row(r) for r in rows]  # type: ignore
 
 
-async def update_lightning_invoice(
+async def update_bolt11_mint_quote(
     db: Database,
-    id: str,
-    paid: bool,
-    time_paid: Optional[int] = None,
-    preimage: Optional[str] = None,
+    quote: str,
+    state: MintQuoteState,
+    paid_time: int,
     conn: Optional[Connection] = None,
 ) -> None:
+    await (conn or db).execute(
+        """
+        UPDATE bolt11_mint_quotes
+        SET state = :state, paid_time = :paid_time
+        WHERE quote = :quote
+        """,
+        {
+            "state": state.value,
+            "paid_time": paid_time,
+            "quote": quote,
+        },
+    )
+
+
+async def store_bolt11_melt_quote(
+    db: Database,
+    quote: MeltQuote,
+    conn: Optional[Connection] = None,
+) -> None:
+    await (conn or db).execute(
+        """
+        INSERT INTO bolt11_melt_quotes
+            (quote, mint, method, request, checking_id, unit, amount, fee_reserve, state, created_time, paid_time, fee_paid, payment_preimage, expiry, change)
+        VALUES (:quote, :mint, :method, :request, :checking_id, :unit, :amount, :fee_reserve, :state, :created_time, :paid_time, :fee_paid, :payment_preimage, :expiry, :change)
+        """,
+        {
+            "quote": quote.quote,
+            "mint": quote.mint,
+            "method": quote.method,
+            "request": quote.request,
+            "checking_id": quote.checking_id,
+            "unit": quote.unit,
+            "amount": quote.amount,
+            "fee_reserve": quote.fee_reserve,
+            "state": quote.state.value,
+            "created_time": quote.created_time,
+            "paid_time": quote.paid_time,
+            "fee_paid": quote.fee_paid,
+            "payment_preimage": quote.payment_preimage,
+            "expiry": quote.expiry,
+            "change": (
+                json.dumps([c.model_dump() for c in quote.change]) if quote.change else ""
+            ),
+        },
+    )
+
+
+async def get_bolt11_melt_quote(
+    db: Database,
+    quote: Optional[str] = None,
+    request: Optional[str] = None,
+    conn: Optional[Connection] = None,
+) -> Optional[MeltQuote]:
+    if not quote and not request:
+        raise ValueError("quote or request must be provided")
     clauses = []
     values: Dict[str, Any] = {}
-    clauses.append("paid = :paid")
-    values["paid"] = paid
+    if quote:
+        clauses.append("quote = :quote")
+        values["quote"] = quote
+    if request:
+        clauses.append("request = :request")
+        values["request"] = request
 
-    if time_paid:
-        clauses.append("time_paid = :time_paid")
-        values["time_paid"] = time_paid
-    if preimage:
-        clauses.append("preimage = :preimage")
-        values["preimage"] = preimage
+    where = ""
+    if clauses:
+        where = f"WHERE {' AND '.join(clauses)}"
+    row = await (conn or db).fetchone(
+        f"""
+        SELECT * from bolt11_melt_quotes
+        {where}
+        """,
+        values,
+    )
 
+    return MeltQuote.from_row(row) if row else None  # type: ignore
+
+
+async def get_bolt11_melt_quotes(
+    db: Database,
+    mint: Optional[str] = None,
+    state: Optional[MeltQuoteState] = None,
+    conn: Optional[Connection] = None,
+) -> List[MeltQuote]:
+    clauses = []
+    values: Dict[str, Any] = {}
+    if mint:
+        clauses.append("mint = :mint")
+        values["mint"] = mint
+    if state:
+        clauses.append("state = :state")
+        values["state"] = state.value
+
+    where = ""
+    if clauses:
+        where = f"WHERE {' AND '.join(clauses)}"
+    rows = await (conn or db).fetchall(
+        f"""
+        SELECT * from bolt11_melt_quotes
+        {where}
+        """,
+        values,
+    )
+    return [MeltQuote.from_row(r) for r in rows]  # type: ignore
+
+
+async def update_bolt11_melt_quote(
+    db: Database,
+    quote: str,
+    state: MeltQuoteState,
+    paid_time: int,
+    fee_paid: int,
+    payment_preimage: str,
+    conn: Optional[Connection] = None,
+) -> None:
     await (conn or db).execute(
-        f"UPDATE invoices SET {', '.join(clauses)} WHERE id = :id",
-        {**values, "id": id},
+        """
+        UPDATE bolt11_melt_quotes
+        SET state = :state, paid_time = :paid_time, fee_paid = :fee_paid, payment_preimage = :payment_preimage
+        WHERE quote = :quote
+        """,
+        {
+            "state": state.value,
+            "paid_time": paid_time,
+            "fee_paid": fee_paid,
+            "payment_preimage": payment_preimage,
+            "quote": quote,
+        },
     )
 
 
@@ -402,30 +526,6 @@ async def set_secret_derivation(
     )
 
 
-async def set_nostr_last_check_timestamp(
-    db: Database,
-    timestamp: int,
-    conn: Optional[Connection] = None,
-) -> None:
-    await (conn or db).execute(
-        "UPDATE nostr SET last = :last WHERE type = :type",
-        {"last": timestamp, "type": "dm"},
-    )
-
-
-async def get_nostr_last_check_timestamp(
-    db: Database,
-    conn: Optional[Connection] = None,
-) -> Optional[int]:
-    row = await (conn or db).fetchone(
-        """
-        SELECT last from nostr WHERE type = :type
-        """,
-        {"type": "dm"},
-    )
-    return row[0] if row else None
-
-
 async def get_seed_and_mnemonic(
     db: Database,
     conn: Optional[Connection] = None,
@@ -462,3 +562,59 @@ async def store_seed_and_mnemonic(
             "mnemonic": mnemonic,
         },
     )
+
+
+async def store_mint(
+    db: Database,
+    mint: WalletMint,
+    conn: Optional[Connection] = None,
+) -> None:
+    await (conn or db).execute(
+        """
+        INSERT INTO mints
+          (url, info, updated)
+        VALUES (:url, :info, :updated)
+        """,
+        {
+            "url": mint.url,
+            "info": mint.info,
+            "updated": int(time.time()),
+        },
+    )
+
+
+async def update_mint(
+    db: Database,
+    mint: WalletMint,
+    conn: Optional[Connection] = None,
+) -> None:
+    await (conn or db).execute(
+        """
+        UPDATE mints
+        SET info = :info, updated = :updated, access_token = :access_token, refresh_token = :refresh_token, username = :username, password = :password
+        WHERE url = :url
+        """,
+        {
+            "url": mint.url,
+            "info": mint.info,
+            "updated": int(time.time()),
+            "access_token": mint.access_token,
+            "refresh_token": mint.refresh_token,
+            "username": mint.username,
+            "password": mint.password,
+        },
+    )
+
+
+async def get_mint_by_url(
+    db: Database,
+    url: str,
+    conn: Optional[Connection] = None,
+) -> Optional[WalletMint]:
+    row = await (conn or db).fetchone(
+        """
+        SELECT * from mints WHERE url = :url
+        """,
+        {"url": url},
+    )
+    return WalletMint.model_validate(dict(row)) if row else None

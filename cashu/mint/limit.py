@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import WebSocket, status
 from fastapi.responses import JSONResponse
 from limits import RateLimitItemPerMinute
@@ -10,9 +12,10 @@ from ..core.settings import settings
 
 
 def _rate_limit_exceeded_handler(request: Request, exc: Exception) -> JSONResponse:
-    remote_address = get_remote_address(request)
+    remote_address = _get_client_ip(request)
     logger.warning(
-        f"Rate limit {settings.mint_global_rate_limit_per_minute}/minute exceeded: {remote_address}"
+        f"Rate limit {settings.mint_global_rate_limit_per_minute}/minute exceeded:"
+        f" {remote_address}"
     )
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -20,8 +23,27 @@ def _rate_limit_exceeded_handler(request: Request, exc: Exception) -> JSONRespon
     )
 
 
+def _get_client_ip(request: Request) -> str:
+    """Extract the client IP from the request, checking proxy headers first
+    if configured to trust them.
+
+    Header priority (when proxy trust is enabled):
+      1. CF-Connecting-IP  – set by Cloudflare
+      2. X-Forwarded-For   – set by most reverse proxies (first entry)
+      3. request.client     – direct connection IP (fallback)
+    """
+    if settings.mint_rate_limit_proxy_trust:
+        cf_ip = request.headers.get("cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.strip()
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
+
 def get_remote_address_excluding_local(request: Request) -> str:
-    remote_address = get_remote_address(request)
+    remote_address = _get_client_ip(request)
     if remote_address == "127.0.0.1":
         return ""
     return remote_address
@@ -42,26 +64,26 @@ limiter = Limiter(
 )
 
 
-def assert_limit(identifier: str):
+def assert_limit(identifier: str, limit: Optional[int] = None):
     """Custom rate limit handler that accepts a string identifier
     and raises an exception if the rate limit is exceeded. Uses the
     setting `mint_transaction_rate_limit_per_minute` for the rate limit.
 
     Args:
         identifier (str): The identifier to use for the rate limit. IP address for example.
+        limit (Optional[int], optional): The rate limit per minute to use. Defaults to None
 
     Raises:
         Exception: If the rate limit is exceeded.
     """
     global limiter
+    limit_per_minute = limit or settings.mint_transaction_rate_limit_per_minute
     success = limiter._limiter.hit(
-        RateLimitItemPerMinute(settings.mint_transaction_rate_limit_per_minute),
+        RateLimitItemPerMinute(limit_per_minute),
         identifier,
     )
     if not success:
-        logger.warning(
-            f"Rate limit {settings.mint_transaction_rate_limit_per_minute}/minute exceeded: {identifier}"
-        )
+        logger.warning(f"Rate limit {limit_per_minute}/minute exceeded: {identifier}")
         raise Exception("Rate limit exceeded")
 
 
@@ -74,6 +96,13 @@ def get_ws_remote_address(ws: WebSocket) -> str:
     Returns:
         str: The ip address for the current websocket.
     """
+    if settings.mint_rate_limit_proxy_trust:
+        cf_ip = ws.headers.get("cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.strip()
+        xff = ws.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
     if not ws.client or not ws.client.host:
         return "127.0.0.1"
 
